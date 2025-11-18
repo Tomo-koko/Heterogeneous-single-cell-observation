@@ -1,0 +1,3021 @@
+# In this analysis, we used the generated data by computational simulation with Python.
+# Before running this code, please refer to the Python code.
+
+install.packages(c("hdf5r", "Seurat", "tidyverse", "reticulate", "R.utils", "SAVER", "htmlwidgets", "remotes", "BiocManager"))
+
+# For the first time, you have to install miniconda via reticulate.
+# reticulate::install_miniconda()
+
+remotes::install_github("mojaveazure/seurat-disk")
+BiocManager::install(c("zellkonverter"))
+remotes::install_github("satijalab/seurat-wrappers")
+remotes::install_github("VivianStats/scImpute")
+reticulate::conda_create("r-scanpy", packages = "python=3.10")
+reticulate::conda_install(
+  envname  = "r-scanpy",
+  packages = c("scanpy", "anndata", "numpy", "scipy", "pandas", "matplotlib", "h5py", "umap-learn", "python-igraph", "leidenalg", "pynndescent"),
+  channel  = "conda-forge")
+
+# Python environment setting
+py <- reticulate::conda_python("r-scanpy")
+Sys.setenv(RETICULATE_PYTHON = py)
+reticulate::use_condaenv("r-scanpy", required = TRUE)
+reticulate::py_config()
+sc <- reticulate::import("scanpy", convert = FALSE)
+np <- reticulate::import("numpy", convert = FALSE)
+
+# Library (Imputation libraries such as scImpute or SAVER will be loaded at that time)
+library(hdf5r)
+library(Seurat)
+library(tidyverse)
+library(plotly)
+library(SeuratDisk)
+library(SeuratWrappers)
+library(reticulate)
+library(zellkonverter)
+library(scales)
+library(htmlwidgets)
+
+# Fix seed
+set.seed(42)
+
+# Download the dataset
+## From the publication "Miao, Y., Pek, N. M., Tan, C., Jiang, C., Yu, Z., Iwasawa, K., Shi, M., Kechele, D. O., Sundaram, N., Pastrana-Gomez, V., Sinner, D. I., Liu, X., Lin, K. C., Na, C. L., Kishimoto, K., Yang, M. C., Maharjan, S., Tchieu, J., Whitsett, J. A., Zhang, Y. S., … Gu, M. (2025). Co-development of mesoderm and endoderm enables organotypic vascularization in lung and gut organoids. Cell, S0092-8674(25)00628-2. Advance online publication. https://doi.org/10.1016/j.cell.2025.05.041"
+## GSE250399
+hlpo_url <- "https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSM7978640&format=file&file=GSM7978640%5FDay21%5FvHLPO%5Ffiltered%5Ffeature%5Fbc%5Fmatrix%2Eh5"
+output_file_hlpo <- "GSM7978640_Day21_vHLPO_filtered_feature_bc_matrix.h5"
+download.file(url = hlpo_url, destfile = output_file_hlpo, method = "curl", mode = "wb")
+data_matrix_hlpo <- Read10X_h5(output_file_hlpo)
+seurat_hlpo <- CreateSeuratObject(counts = data_matrix_hlpo)
+seurat_hlpo@assays$RNA@layers$counts@Dim ## the number of genes and cells
+## 36601 14100
+
+# Check UMI distributions
+seurat_hlpo_umi <- subset(seurat_hlpo,
+                          subset = nCount_RNA >= 1000 & nCount_RNA <= 40000)
+umi_counts <- seurat_hlpo_umi$nCount_RNA
+
+png(filename = "umihist_hlpo_global.png", width = 480, height = 320)
+hist(umi_counts,
+     breaks = 40,
+     main = NULL,
+     xlab = "Total UMIs per Cell",
+     ylab = "Cell Counts",
+     col = "skyblue", border = "white",
+     ylim = c(0, 1500)
+)
+dev.off()
+
+# N(k) distribution
+umi_min <- 1000L
+umi_max <- 12000L
+bin_width <- 1000L
+bin_starts <- seq(umi_min, umi_max - bin_width, by = bin_width)  
+bin_medians <- bin_starts + bin_width/2
+
+seurat_hlpo_min_max <- subset(seurat_hlpo, subset = nCount_RNA >= umi_min & nCount_RNA < umi_max)
+counts_matrix <- LayerData(seurat_hlpo_min_max[["RNA"]], "counts")
+cell_umis <- seurat_hlpo_min_max$nCount_RNA
+names(cell_umis) <- colnames(counts_matrix)
+
+# Build N(k) per cell once (k = 0..max_count-1, count at max_count is not reliable)
+max_count <- 71L
+k_vals <- 0:max_count
+result_matrix <- matrix(0L, nrow = ncol(counts_matrix), ncol = length(k_vals))
+rownames(result_matrix) <- colnames(counts_matrix)
+colnames(result_matrix) <- as.character(k_vals)
+
+for (i in seq_len(ncol(counts_matrix))) {
+  # extract nonzero counts for cell i
+  cell_counts <- counts_matrix[, i, drop = FALSE]
+  nz <- cell_counts@x
+  # tabulate counts up to max_count (anything > max_count is ignored in this display)
+  tb <- table(factor(pmin(nz, max_count), levels = k_vals))
+  # zeros = total genes - number of nonzeros
+  zeros <- nrow(counts_matrix) - length(nz)
+  tb[["0"]] <- zeros
+  result_matrix[i, ] <- as.integer(tb)
+}
+
+# For each UMI bin, average N(k) across cells in that bin
+lines_df <- lapply(seq_along(bin_starts), function(j) {
+  lo <- bin_starts[j]; hi <- lo + bin_width
+  depth <- bin_medians[j]
+  # select cells in [lo, hi)
+  sel_cells <- names(cell_umis)[cell_umis >= lo & cell_umis < hi]
+  if (length(sel_cells) == 0) return(NULL)
+  # mean across selected rows
+  mean_k <- colMeans(result_matrix[sel_cells, , drop = FALSE])
+  tibble(
+    bin_label = sprintf("[%d, %d)", lo, hi),
+    depth     = depth,
+    count     = as.integer(k_vals),
+    mean_genes = as.numeric(mean_k)
+  )
+}) %>% bind_rows()
+
+x_max_show <- max_count - 1
+plot_df <- lines_df %>% filter(count <= x_max_show)
+
+# Log10 transform for 3D axis
+eps <- 1
+plot_df <- plot_df %>%
+  mutate(y_val = pmax(mean_genes, eps),
+         y_log10 = log10(y_val))
+
+plt <- plot_ly()
+for (lab in unique(plot_df$bin_label)) {
+  df_bin <- filter(plot_df, bin_label == lab)
+  plt <- add_trace(
+    plt, data = df_bin,
+    x = ~count, y = ~y_log10, z = ~depth,
+    type = "scatter3d", mode = "lines+markers",
+    name = lab,
+    marker = list(size = 2),
+    hovertemplate = paste0(
+      "Bin: ", lab, "<br>",
+      "k: %{x}<br>",
+      "Mean genes N(k): %{customdata:.3f}<br>",
+      "Depth (UMI median): %{z}<extra></extra>"
+    ),
+    customdata = df_bin$y_val
+  )
+}
+
+plt <- layout(
+  plt,
+  scene = list(
+    xaxis = list(
+      title    = "UMI count per gene (k)",
+      tickmode = "linear",
+      tick0    = 0,  
+      dtick    = 10,  
+      ticklen  = 8, 
+      tickwidth= 2, 
+      tickfont = list(size = 12, family = "Arial", color = "black"),
+      showgrid = TRUE,
+      gridcolor= "rgba(0,0,0,0.25)",
+      gridwidth= 1.5,
+      zeroline = TRUE,
+      zerolinecolor = "black",
+      zerolinewidth = 2
+    ),
+    yaxis = list(title = "log10 N(k) clamped by log10(1.0)"),
+    zaxis = list(title = "UMI bin median"),
+    xaxis_showspikes = FALSE, 
+    yaxis_showspikes = FALSE,
+    zaxis_showspikes = FALSE
+  ),
+  legend = list(orientation = "h", x = 0, y = 1.05)
+)
+
+plt # choose "zoom"
+saveWidget(
+  plt,
+  file = "/Users/<user_name>/Desktop/zero_eim/zero_final/Nk_hlpo_YMiaoetal_3d_plot.html",
+  selfcontained = TRUE
+)
+
+## From the publication "Mereu E, Lafzi A, Moutinho C, Ziegenhain C et al. Benchmarking single-cell RNA-sequencing protocols for cell atlas projects. Nat Biotechnol 2020 Jun;38(6):747-755."
+## GSE133535
+mouse_exp_url <- "https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE133535&format=file&file=GSE133535%5F10X2x5Kcell250Kreads%5Fmouse%5Fexp%5Fmat%2Etsv%2Egz"
+output_file_mouse_exp <- "GSE133535_10X2x5Kcell250Kreads_mouse_exp_mat.tsv.gz"
+mouse_meta_url <- "https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE133535&format=file&file=GSE133535%5F10X2x5Kcell250Kreads%5Fmouse%5Fmetada%2Etsv%2Egz"
+output_file_mouse_meta <- "GSE133535_10X2x5Kcell250Kreads_mouse_metada.tsv.gz"
+download.file(url = mouse_exp_url, destfile = output_file_mouse_exp, method = "curl", mode = "wb")
+download.file(url = mouse_meta_url, destfile = output_file_mouse_meta, method = "curl", mode = "wb")
+mouse_exp <- read.delim(
+  gzfile("GSE133535_10X2x5Kcell250Kreads_mouse_exp_mat.tsv.gz"),
+  header = TRUE,
+  check.names = FALSE
+)
+expr_mat <- as.matrix(mouse_exp)
+expr_mat <- Matrix::Matrix(expr_mat, sparse = TRUE)
+mouse_meta <- read.delim(
+  gzfile("GSE133535_10X2x5Kcell250Kreads_mouse_metada.tsv.gz"),
+  header = TRUE,
+  check.names = FALSE
+)
+seurat_mouse <- CreateSeuratObject(
+  counts       = expr_mat,
+  project      = "GSE133535_10X2x5Kcell250Kreads_mouse",
+  meta.data    = mouse_meta
+)
+seurat_mouse@assays$RNA@layers$counts@Dim ## the number of genes and cells
+## 34900 10000
+
+# Check UMI distributions
+seurat_mouse_umi <- subset(seurat_mouse,
+                          subset = nCount_RNA >= 1000 & nCount_RNA <= 40000)
+umi_counts <- seurat_mouse_umi$nCount_RNA
+
+png(filename = "umihist_mouse_global.png", width = 480, height = 320)
+hist(umi_counts,
+     breaks = 40,
+     main = NULL,
+     xlab = "Total UMIs per Cell",
+     ylab = "Cell Counts",
+     col = "skyblue", border = "white",
+     ylim = c(0, 1500)
+)
+dev.off()
+
+# N(k) distribution
+umi_min <- 1000L
+umi_max <- 12000L
+bin_width <- 1000L
+bin_starts <- seq(umi_min, umi_max - bin_width, by = bin_width)  
+bin_medians <- bin_starts + bin_width/2
+
+seurat_mouse_min_max <- subset(seurat_mouse, subset = nCount_RNA >= umi_min & nCount_RNA < umi_max)
+counts_matrix <- LayerData(seurat_mouse_min_max[["RNA"]], "counts")
+cell_umis <- seurat_mouse_min_max$nCount_RNA
+names(cell_umis) <- colnames(counts_matrix)
+
+# Build N(k) per cell once (k = 0..max_count-1, count at max_count is not reliable)
+max_count <- 71L
+k_vals <- 0:max_count
+result_matrix <- matrix(0L, nrow = ncol(counts_matrix), ncol = length(k_vals))
+rownames(result_matrix) <- colnames(counts_matrix)
+colnames(result_matrix) <- as.character(k_vals)
+
+for (i in seq_len(ncol(counts_matrix))) {
+  # extract nonzero counts for cell i
+  cell_counts <- counts_matrix[, i, drop = FALSE]
+  nz <- cell_counts@x
+  # tabulate counts up to max_count (anything > max_count is ignored in this display)
+  tb <- table(factor(pmin(nz, max_count), levels = k_vals))
+  # zeros = total genes - number of nonzeros
+  zeros <- nrow(counts_matrix) - length(nz)
+  tb[["0"]] <- zeros
+  result_matrix[i, ] <- as.integer(tb)
+}
+
+# For each UMI bin, average N(k) across cells in that bin
+lines_df <- lapply(seq_along(bin_starts), function(j) {
+  lo <- bin_starts[j]; hi <- lo + bin_width
+  depth <- bin_medians[j]
+  # select cells in [lo, hi)
+  sel_cells <- names(cell_umis)[cell_umis >= lo & cell_umis < hi]
+  if (length(sel_cells) == 0) return(NULL)
+  # mean across selected rows
+  mean_k <- colMeans(result_matrix[sel_cells, , drop = FALSE])
+  tibble(
+    bin_label = sprintf("[%d, %d)", lo, hi),
+    depth     = depth,
+    count     = as.integer(k_vals),
+    mean_genes = as.numeric(mean_k)
+  )
+}) %>% bind_rows()
+
+x_max_show <- max_count - 1
+plot_df <- lines_df %>% filter(count <= x_max_show)
+
+# Log10 transform for 3D axis
+eps <- 1
+plot_df <- plot_df %>%
+  mutate(y_val = pmax(mean_genes, eps),
+         y_log10 = log10(y_val))
+
+plt <- plot_ly()
+for (lab in unique(plot_df$bin_label)) {
+  df_bin <- filter(plot_df, bin_label == lab)
+  plt <- add_trace(
+    plt, data = df_bin,
+    x = ~count, y = ~y_log10, z = ~depth,
+    type = "scatter3d", mode = "lines+markers",
+    name = lab,
+    marker = list(size = 2),
+    hovertemplate = paste0(
+      "Bin: ", lab, "<br>",
+      "k: %{x}<br>",
+      "Mean genes N(k): %{customdata:.3f}<br>",
+      "Depth (UMI median): %{z}<extra></extra>"
+    ),
+    customdata = df_bin$y_val
+  )
+}
+
+plt <- layout(
+  plt,
+  scene = list(
+    xaxis = list(
+      title    = "UMI count per gene (k)",
+      tickmode = "linear",
+      tick0    = 0,  
+      dtick    = 10,  
+      ticklen  = 8, 
+      tickwidth= 2, 
+      tickfont = list(size = 12, family = "Arial", color = "black"),
+      showgrid = TRUE,
+      gridcolor= "rgba(0,0,0,0.25)",
+      gridwidth= 1.5,
+      zeroline = TRUE,
+      zerolinecolor = "black",
+      zerolinewidth = 2
+    ),
+    yaxis = list(title = "log10 N(k) clamped by log10(1.0)"),
+    zaxis = list(title = "UMI bin median"),
+    xaxis_showspikes = FALSE, 
+    yaxis_showspikes = FALSE,
+    zaxis_showspikes = FALSE
+  ),
+  legend = list(orientation = "h", x = 0, y = 1.05)
+)
+
+plt # choose "zoom"
+saveWidget(
+  plt,
+  file = "/Users/<user_name>/Desktop/zero_eim/zero_final/Nk_mouse_EMereuetal_3d_plot.html",
+  selfcontained = TRUE
+)
+
+## From 10X Genomics Official Database
+url_pbmc <- "https://cf.10xgenomics.com/samples/cell-exp/6.1.0/10k_PBMC_3p_nextgem_Chromium_X/10k_PBMC_3p_nextgem_Chromium_X_filtered_feature_bc_matrix.h5"
+output_file_pbmc <- "10k_PBMC_3p_nextgem_Chromium_X_filtered_feature_bc_matrix.h5"
+download.file(url_pbmc, destfile = output_file_pbmc, method = "curl", mode = "wb")
+data_matrix_pbmc <- Read10X_h5(output_file_pbmc)
+seurat_pbmc <- CreateSeuratObject(counts = data_matrix_pbmc)
+seurat_pbmc@assays$RNA@layers$counts@Dim ## the number of genes and cells
+# [1] 36601 11996
+
+# Check UMI distributions
+seurat_pbmc_umi <- subset(seurat_pbmc, subset = nCount_RNA >= 1000 & nCount_RNA <= 40000)
+umi_counts <- seurat_pbmc_umi$nCount_RNA
+
+png(filename = "umihist_pbmc_global.png", width = 480, height = 320)
+hist(umi_counts,
+     breaks = 40,
+     main = NULL,
+     xlab = "Total UMIs per Cell",
+     ylab = "Cell Counts",
+     col = "skyblue", border = "white",
+     ylim = c(0, 2000)
+)
+dev.off()
+
+# N(k) distribution
+umi_min <- 1000L
+umi_max <- 12000L
+bin_width <- 1000L
+bin_starts <- seq(umi_min, umi_max - bin_width, by = bin_width)  
+bin_medians <- bin_starts + bin_width/2    
+
+seurat_pbmc_min_max <- subset(seurat_pbmc, subset = nCount_RNA >= umi_min & nCount_RNA < umi_max)
+counts_matrix <- LayerData(seurat_pbmc_min_max[["RNA"]], "counts")
+cell_umis <- seurat_pbmc_min_max$nCount_RNA
+names(cell_umis) <- colnames(counts_matrix)
+
+# Build N(k) per cell once (k = 0..max_count-1, !!count at max_count is not reliable!!)
+max_count <- 71L
+k_vals <- 0:max_count
+result_matrix <- matrix(0L, nrow = ncol(counts_matrix), ncol = length(k_vals))
+rownames(result_matrix) <- colnames(counts_matrix)
+colnames(result_matrix) <- as.character(k_vals)
+
+for (i in seq_len(ncol(counts_matrix))) {
+  cell_counts <- counts_matrix[, i, drop = FALSE]
+  nz <- cell_counts@x
+  # tabulate counts up to max_count (counts at "max_count" should be ignored!!)
+  tb <- table(factor(pmin(nz, max_count), levels = k_vals))
+  # zeros = total genes - number of nonzeros
+  zeros <- nrow(counts_matrix) - length(nz)
+  tb[["0"]] <- zeros
+  result_matrix[i, ] <- as.integer(tb)
+}
+
+# For each UMI bin, average N(k) across cells in that bin
+lines_df <- lapply(seq_along(bin_starts), function(j) {
+  lo <- bin_starts[j]; hi <- lo + bin_width
+  depth <- bin_medians[j]
+  # select cells in [lo, hi)
+  sel_cells <- names(cell_umis)[cell_umis >= lo & cell_umis < hi]
+  if (length(sel_cells) == 0) return(NULL)
+  # mean across selected rows
+  mean_k <- colMeans(result_matrix[sel_cells, , drop = FALSE])
+  tibble(
+    bin_label = sprintf("[%d, %d)", lo, hi),
+    depth     = depth,
+    count     = as.integer(k_vals),
+    mean_genes = as.numeric(mean_k)
+  )
+}) %>% bind_rows()
+
+x_max_show <- max_count - 1
+plot_df <- lines_df %>% filter(count <= x_max_show)
+
+# Log10 transform for 3D axis (plotly 3D doesn't natively log-scale)
+eps <- 1
+plot_df <- plot_df %>%
+  mutate(y_val = pmax(mean_genes, eps),
+         y_log10 = log10(y_val))
+
+plt <- plot_ly()
+for (lab in unique(plot_df$bin_label)) {
+  df_bin <- filter(plot_df, bin_label == lab)
+  plt <- add_trace(
+    plt, data = df_bin,
+    x = ~count, y = ~y_log10, z = ~depth,
+    type = "scatter3d", mode = "lines+markers",
+    name = lab,
+    marker = list(size = 2),
+    hovertemplate = paste0(
+      "Bin: ", lab, "<br>",
+      "k: %{x}<br>",
+      "Mean genes N(k): %{customdata:.3f}<br>",
+      "Depth (UMI median): %{z}<extra></extra>"
+    ),
+    customdata = df_bin$y_val
+  )
+}
+
+plt <- layout(
+  plt,
+  scene = list(
+    xaxis = list(
+      title    = "UMI count per gene (k)",
+      tickmode = "linear",
+      tick0    = 0,  
+      dtick    = 10,  
+      ticklen  = 8, 
+      tickwidth= 2, 
+      tickfont = list(size = 12, family = "Arial", color = "black"),
+      showgrid = TRUE,
+      gridcolor= "rgba(0,0,0,0.25)",
+      gridwidth= 1.5,
+      zeroline = TRUE,
+      zerolinecolor = "black",
+      zerolinewidth = 2
+    ),
+    yaxis = list(title = "log10 N(k) clamped by log10(1.0)"),
+    zaxis = list(title = "UMI bin median"),
+    xaxis_showspikes = FALSE, 
+    yaxis_showspikes = FALSE,
+    zaxis_showspikes = FALSE
+  ),
+  legend = list(orientation = "h", x = 0, y = 1.05)
+)
+
+plt # choose "zoom"
+saveWidget(
+  plt,
+  file = "/Users/<user_name>/Desktop/zero_eim/zero_final/Nk_pbmc_10X_3d_plot.html",
+  selfcontained = TRUE
+)
+
+eps <- 1
+max_count <- 60
+plot_df2 <- lines_df %>%
+  filter(count <= max_count) %>%
+  mutate(
+    y_plot   = pmax(mean_genes, eps),
+    bin_med  = as.integer(depth),
+    bin_fac  = factor(bin_med, levels = sort(unique(as.integer(depth))))
+  )
+
+png(filename = "UMI_variation_N_k_pbmc_2d.png", width = 480, height = 480)
+ggplot(plot_df2, aes(x = count, y = y_plot, color = bin_fac, group = bin_fac)) +
+  geom_line(linewidth = 1, alpha = 0.9) +
+  geom_point(size = 1.8, alpha = 0.9) +
+  scale_x_continuous(breaks = seq(0, max_count, by = 10)) + 
+  scale_y_log10(
+    limits = c(0.8, 40000),
+    breaks = log_breaks(base = 10),
+    minor_breaks = function(lims) {
+      majors <- 10 ^ seq(floor(log10(lims[1])), ceiling(log10(lims[2])))
+      minors <- as.vector(outer(majors, 1:9))
+      minors[minors > lims[1] & minors < lims[2]]
+    },
+    labels = label_log(base = 10)
+  ) +
+  labs(
+    x = "UMI count per gene (k)",
+    y = "log-scaled N(k) clamped by 1.0",
+    color = "UMI bin median"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.border = element_rect(color = "black", fill = NA),
+    axis.title.x = element_text(margin = margin(t = 6)),
+    axis.title.y = element_text(margin = margin(r = 6)),
+    legend.position = "top"
+  )
+dev.off()
+
+# Plot E[N(k)] under Poisson sampling
+csv_path <- "/Users/<user_name>/Desktop/zero_eim/E_Nk_combo_poisson_depth_grid.csv"
+df <- read_csv(csv_path,
+    col_types      = cols(
+    depth          = col_double(),
+    k              = col_integer(),
+    expected_genes = col_double()))
+max_k_show <- max(df$k)
+
+eps <- 1
+plot_df <- df %>%
+  filter(k <= max_k_show) %>%
+  mutate(
+    y_val   = pmax(expected_genes, eps),
+    y_log10 = log10(y_val)
+  )
+
+plt <- plot_ly()
+
+for (d in sort(unique(plot_df$depth))) {
+  df_d <- filter(plot_df, depth == d)
+  
+  plt <- add_trace(
+    plt,
+    data  = df_d,
+    x     = ~k,
+    y     = ~y_log10,
+    z     = ~depth,
+    type  = "scatter3d",
+    mode  = "lines+markers",
+    name  = paste0("Depth ", d),
+    marker = list(size = 2),
+    customdata = df_d$y_val,
+    hovertemplate = paste0(
+      "Depth: ", d, "<br>",
+      "k: %{x}<br>",
+      "E[N(k)]: %{customdata:.3f}<extra></extra>"
+    )
+  )
+}
+
+plt <- layout(
+  plt,
+  scene = list(
+    xaxis = list(
+      title    = "UMI count per gene (k)",
+      tickmode = "linear",
+      tick0    = 0,
+      dtick    = 10,
+      showgrid = TRUE
+    ),
+    yaxis = list(
+      title = "log10 E[N(k)]"
+    ),
+    zaxis = list(
+      title = "Sampling depth (total UMIs)"
+    ),
+    xaxis_showspikes = FALSE,
+    yaxis_showspikes = FALSE,
+    zaxis_showspikes = FALSE
+  ),
+  legend = list(
+    orientation = "h",
+    x = 0,
+    y = 1.05
+  )
+)
+
+plt # choose Zoom
+saveWidget(
+   plt,
+   file = "/Users/<user_name>/Desktop/zero_eim/zero_final/E_Nk_combo_Poisson_3d_plot.html",
+   selfcontained = TRUE
+  )
+
+# Plot E[N(k)] under NB sampling with theta = 0.5
+csv_path <- "/Users/<user_name>/Desktop/zero_eim/E_Nk_combo_nb_depth_grid.csv"
+df <- read_csv(csv_path,
+               col_types      = cols(
+                 depth          = col_double(),
+                 k              = col_integer(),
+                 expected_genes = col_double()))
+max_k_show <- max(df$k)
+
+eps <- 1
+plot_df <- df %>%
+  filter(k <= max_k_show) %>%
+  mutate(
+    y_val   = pmax(expected_genes, eps),
+    y_log10 = log10(y_val)
+  )
+
+plt <- plot_ly()
+
+for (d in sort(unique(plot_df$depth))) {
+  df_d <- filter(plot_df, depth == d)
+  
+  plt <- add_trace(
+    plt,
+    data  = df_d,
+    x     = ~k,
+    y     = ~y_log10,
+    z     = ~depth,
+    type  = "scatter3d",
+    mode  = "lines+markers",
+    name  = paste0("Depth ", d),
+    marker = list(size = 2),
+    customdata = df_d$y_val,
+    hovertemplate = paste0(
+      "Depth: ", d, "<br>",
+      "k: %{x}<br>",
+      "E[N(k)]: %{customdata:.3f}<extra></extra>"
+    )
+  )
+}
+
+plt <- layout(
+  plt,
+  scene = list(
+    xaxis = list(
+      title    = "UMI count per gene (k)",
+      tickmode = "linear",
+      tick0    = 0,
+      dtick    = 10,
+      showgrid = TRUE
+    ),
+    yaxis = list(
+      title = "log10 E[N(k)]"
+    ),
+    zaxis = list(
+      title = "Sampling depth (total UMIs)"
+    ),
+    xaxis_showspikes = FALSE,
+    yaxis_showspikes = FALSE,
+    zaxis_showspikes = FALSE
+  ),
+  legend = list(
+    orientation = "h",
+    x = 0,
+    y = 1.05
+  )
+)
+
+plt # choose Zoom
+saveWidget(
+  plt,
+  file = "/Users/<user_name>/Desktop/zero_eim/zero_final/E_Nk_combo_nb_3d_plot.html",
+  selfcontained = TRUE
+)
+
+# Analyze pseudo-object
+mat <- Read10X_h5("~/Desktop/zero_eim/filtered_feature_bc_matrix_trivial_change.h5")
+seurat_pseudo <- CreateSeuratObject(mat)
+seurat_pseudo$group <- sub(".*_(REAL|D1)$", "\\1", colnames(seurat_pseudo))
+seurat_pseudo$group <- dplyr::recode(seurat_pseudo$group, REAL = "Cell 1", D1 = "Cell 4")
+table(seurat_pseudo$group)
+
+png(filename = "vln_pseudo_signal.png", width = 240, height = 480)
+VlnPlot(seurat_pseudo, features = "nCount_RNA")
+dev.off()
+
+num_neighbors <- floor(seurat_pseudo@assays$RNA@layers$counts@Dim[[2]] / 100)
+seurat_pseudo <- NormalizeData(seurat_pseudo, normalization.method = "LogNormalize", scale.factor = 10000)
+seurat_pseudo <- FindVariableFeatures(seurat_pseudo, selection.method = "vst", nfeatures = 2000)
+seurat_pseudo <- ScaleData(seurat_pseudo)
+seurat_pseudo <- RunPCA(seurat_pseudo)
+
+png(filename = "pca_pseudo_signal.png", width = 480, height = 320)
+ElbowPlot(seurat_pseudo, reduction = "pca", ndims = 50)
+dev.off()
+
+seurat_pseudo <- FindNeighbors(seurat_pseudo, dims = 1:30, k.param = num_neighbors)
+seurat_pseudo <- FindClusters(seurat_pseudo, resolution = 1)
+seurat_pseudo <- RunUMAP(seurat_pseudo, dims = 1:30, n.neighbors = num_neighbors)
+
+cl_levels <- levels(seurat_pseudo$seurat_clusters)
+cluster_cols <- Seurat::DiscretePalette(length(cl_levels), palette = "parade")
+names(cluster_cols) <- cl_levels
+
+png(filename = "umap_pseudo_signal_clusters.png", width = 480, height = 320)
+DimPlot(seurat_pseudo, 
+        group.by = "seurat_clusters", 
+        label = FALSE,
+        cols     = cluster_cols,
+        pt.size = 1) + 
+  theme(plot.title = element_blank()) + 
+  NoAxes()
+dev.off()
+
+png(filename = "umap_pseudo_signal_group.png", width = 480, height = 320)
+DimPlot(seurat_pseudo, 
+        group.by = "group", 
+        label = FALSE,
+        pt.size = 1) + 
+  theme(plot.title = element_blank()) + 
+  NoAxes()
+dev.off()
+
+# Hierarchical analysis
+emb <- Embeddings(seurat_pseudo, reduction = "umap")[, 1:2]
+meta <- seurat_pseudo@meta.data[, c("nCount_RNA", "seurat_clusters", "group")]
+df <- data.frame(
+  UMAP_1 = emb[,1],
+  UMAP_2 = emb[,2],
+  nCount_RNA = meta$nCount_RNA,
+  seurat_clusters = meta$seurat_clusters,
+  group = meta$group
+)
+df$log10_nCount <- log10(df$nCount_RNA)
+
+p3d_pseudo_cluster <- plot_ly(
+  df,
+  x = ~UMAP_1, y = ~UMAP_2, z = ~log10_nCount,
+  color = ~seurat_clusters,  
+  colors = unname(cluster_cols),         
+  type = "scatter3d", mode = "markers",
+  marker = list(size = 2, opacity = 1)
+) %>% 
+  layout(
+    scene = list(
+      xaxis = list(title = "UMAP 1"),
+      yaxis = list(title = "UMAP 2"),
+      zaxis = list(title = "log10(Total UMI counts)")   
+    ),
+    legend = list(orientation = "h", y = 1.05)
+  )
+
+p3d_pseudo_cluster # choose Zoom
+saveWidget(
+  p3d_pseudo_cluster,
+  file = "/Users/<user_name>/Desktop/zero_eim/zero_final/trivial_change_global_clusters_3d_plot.html",
+  selfcontained = TRUE
+)
+
+p3d_pseudo_group <- plot_ly(
+  df,
+  x = ~UMAP_1, y = ~UMAP_2, z = ~log10_nCount,
+  color = ~group,           
+  type = "scatter3d", mode = "markers",
+  marker = list(size = 2, opacity = 1)
+) %>% 
+  layout(
+    scene = list(
+      xaxis = list(title = "UMAP 1"),
+      yaxis = list(title = "UMAP 2"),
+      zaxis = list(title = "log10(Total UMI counts)")   
+    ),
+    legend = list(orientation = "h", y = 1.05)
+  )
+
+p3d_pseudo_group # choose Zoom
+saveWidget(
+  p3d_pseudo_group,
+  file = "/Users/<user_name>/Desktop/zero_eim/zero_final/trivial_change_global_group_3d_plot.html",
+  selfcontained = TRUE
+)
+
+# Create uniformed subset
+seurat_pseudo_subset <- subset(seurat_pseudo, subset = nCount_RNA > 4000)
+num_neighbors <- floor(seurat_pseudo_subset@assays$RNA@layers$counts@Dim[[2]] / 100)
+
+seurat_pseudo_subset <- NormalizeData(seurat_pseudo_subset, normalization.method = "LogNormalize", scale.factor = 10000)
+seurat_pseudo_subset <- FindVariableFeatures(seurat_pseudo_subset, selection.method = "vst", nfeatures = 2000)
+seurat_pseudo_subset <- ScaleData(seurat_pseudo_subset)
+seurat_pseudo_subset <- RunPCA(seurat_pseudo_subset)
+
+png(filename = "pca_pseudo_signal_subset.png", width = 480, height = 320)
+ElbowPlot(seurat_pseudo_subset, reduction = "pca", ndims = 50)
+dev.off()
+
+seurat_pseudo_subset <- FindNeighbors(seurat_pseudo_subset, dims = 1:30, k.param = num_neighbors)
+seurat_pseudo_subset <- FindClusters(seurat_pseudo_subset, resolution = 1)
+seurat_pseudo_subset <- RunUMAP(seurat_pseudo_subset, dims = 1:30, n.neighbors = num_neighbors)
+
+cl_levels <- levels(seurat_pseudo_subset$seurat_clusters)
+cluster_cols <- Seurat::DiscretePalette(length(cl_levels), palette = "parade")
+names(cluster_cols) <- cl_levels
+
+png(filename = "umap_pseudo_signal_subset_clusters.png", width = 480, height = 320)
+DimPlot(seurat_pseudo_subset, 
+        group.by = "seurat_clusters", 
+        label = FALSE,
+        cols     = cluster_cols,
+        pt.size = 1) + 
+  theme(plot.title = element_blank()) + 
+  NoAxes()
+dev.off()
+
+png(filename = "umap_pseudo_signal_subset_group.png", width = 480, height = 320)
+DimPlot(seurat_pseudo_subset, 
+        group.by = "group", 
+        label = FALSE,
+        pt.size = 1) + 
+  theme(plot.title = element_blank()) + 
+  NoAxes()
+dev.off()
+
+# Analyze pseudo-object
+mat <- Read10X_h5("~/Desktop/zero_eim/filtered_feature_bc_matrix_cell_num_biased.h5")
+seurat_pseudo <- CreateSeuratObject(mat)
+seurat_pseudo$group <- sub(".*_(REAL|D1|D2)$", "\\1", colnames(seurat_pseudo))
+seurat_pseudo$group <- dplyr::recode(seurat_pseudo$group, REAL = "Cell 1", D1 = "Cell 2", D2 = "Cell 3")
+table(seurat_pseudo$group)
+
+png(filename = "vln_pseudo_celnum.png", width = 240, height = 480)
+VlnPlot(seurat_pseudo, features = "nCount_RNA")
+dev.off()
+
+num_neighbors <- floor(seurat_pseudo@assays$RNA@layers$counts@Dim[[2]] / 100)
+seurat_pseudo <- NormalizeData(seurat_pseudo, normalization.method = "LogNormalize", scale.factor = 10000)
+seurat_pseudo <- FindVariableFeatures(seurat_pseudo, selection.method = "vst", nfeatures = 2000)
+seurat_pseudo <- ScaleData(seurat_pseudo)
+seurat_pseudo <- RunPCA(seurat_pseudo)
+
+png(filename = "pca_pseudo_celnum.png", width = 480, height = 320)
+ElbowPlot(seurat_pseudo, reduction = "pca", ndims = 50)
+dev.off()
+
+seurat_pseudo <- FindNeighbors(seurat_pseudo, dims = 1:30, k.param = num_neighbors)
+seurat_pseudo <- FindClusters(seurat_pseudo, resolution = 1)
+seurat_pseudo <- RunUMAP(seurat_pseudo, dims = 1:30, n.neighbors = num_neighbors)
+
+cl_levels <- levels(seurat_pseudo$seurat_clusters)
+cluster_cols <- Seurat::DiscretePalette(length(cl_levels), palette = "parade")
+names(cluster_cols) <- cl_levels
+
+png(filename = "umap_pseudo_celnum_clusters.png", width = 480, height = 320)
+DimPlot(seurat_pseudo, 
+        group.by = "seurat_clusters", 
+        label = FALSE,
+        cols     = cluster_cols,
+        pt.size = 1) + 
+  theme(plot.title = element_blank()) + 
+  NoAxes()
+dev.off()
+
+png(filename = "umap_pseudo_celnum_group.png", width = 480, height = 320)
+DimPlot(seurat_pseudo, 
+        group.by = "group", 
+        label = FALSE,
+        pt.size = 1) + 
+  theme(plot.title = element_blank()) + 
+  NoAxes()
+dev.off()
+
+# Hierarchical analysis
+emb <- Embeddings(seurat_pseudo, reduction = "umap")[, 1:2]
+meta <- seurat_pseudo@meta.data[, c("nCount_RNA", "seurat_clusters", "group")]
+df <- data.frame(
+  UMAP_1 = emb[,1],
+  UMAP_2 = emb[,2],
+  nCount_RNA = meta$nCount_RNA,
+  seurat_clusters = meta$seurat_clusters,
+  group = meta$group
+)
+df$log10_nCount <- log10(df$nCount_RNA)
+
+p3d_pseudo_cluster <- plot_ly(
+  df,
+  x = ~UMAP_1, y = ~UMAP_2, z = ~log10_nCount,
+  color = ~seurat_clusters, 
+  colors = unname(cluster_cols),          
+  type = "scatter3d", mode = "markers",
+  marker = list(size = 2, opacity = 1)
+) %>% 
+  layout(
+    scene = list(
+      xaxis = list(title = "UMAP 1"),
+      yaxis = list(title = "UMAP 2"),
+      zaxis = list(title = "log10(Total UMI counts)")   
+    ),
+    legend = list(orientation = "h", y = 1.05)
+  )
+
+p3d_pseudo_cluster # choose Zoom
+saveWidget(
+  p3d_pseudo_cluster,
+  file = "/Users/<user_name>/Desktop/zero_eim/zero_final/cell_num_biased_clusters_3d_plot.html",
+  selfcontained = TRUE
+)
+
+p3d_pseudo_group <- plot_ly(
+  df,
+  x = ~UMAP_1, y = ~UMAP_2, z = ~log10_nCount,
+  color = ~group,           
+  type = "scatter3d", mode = "markers",
+  marker = list(size = 2, opacity = 1)
+) %>% 
+  layout(
+    scene = list(
+      xaxis = list(title = "UMAP 1"),
+      yaxis = list(title = "UMAP 2"),
+      zaxis = list(title = "log10(Total UMI counts)")   
+    ),
+    legend = list(orientation = "h", y = 1.05)
+  )
+
+p3d_pseudo_group # choose Zoom
+saveWidget(
+  p3d_pseudo_group,
+  file = "/Users/<user_name>/Desktop/zero_eim/zero_final/cell_num_biased_group_3d_plot.html",
+  selfcontained = TRUE
+)
+
+# Analyze pseudo-object in terms of trajectory
+mat <- Read10X_h5("~/Desktop/zero_eim/filtered_feature_bc_matrix_trajectory.h5")
+seurat_pseudo <- CreateSeuratObject(mat)
+seurat_pseudo$group <- sub(".*_(REAL|D1|D2|D3|D4)$", "\\1", colnames(seurat_pseudo))
+seurat_pseudo$group <- dplyr::recode(seurat_pseudo$group, REAL = "Cell A", D1 = "Cell B", D2 = "Cell C", D3 = "Cell D", D4 = "Cell E")
+table(seurat_pseudo$group)
+
+png(filename = "vln_pseudo_traj.png", width = 240, height = 480)
+VlnPlot(seurat_pseudo, features = "nCount_RNA")
+dev.off()
+
+num_neighbors <- floor(seurat_pseudo@assays$RNA@layers$counts@Dim[[2]] / 100)
+seurat_pseudo <- NormalizeData(seurat_pseudo, normalization.method = "LogNormalize", scale.factor = 10000)
+seurat_pseudo <- FindVariableFeatures(seurat_pseudo, selection.method = "vst", nfeatures = 2000)
+seurat_pseudo <- ScaleData(seurat_pseudo)
+seurat_pseudo <- RunPCA(seurat_pseudo)
+
+png(filename = "pca_pseudo_traj.png", width = 480, height = 320)
+ElbowPlot(seurat_pseudo, reduction = "pca", ndims = 50)
+dev.off()
+
+seurat_pseudo <- FindNeighbors(seurat_pseudo, dims = 1:30, k.param = num_neighbors)
+seurat_pseudo <- FindClusters(seurat_pseudo, resolution = 1)
+seurat_pseudo <- RunUMAP(seurat_pseudo, dims = 1:30, n.neighbors = num_neighbors)
+
+cl_levels <- levels(seurat_pseudo$seurat_clusters)
+cluster_cols <- Seurat::DiscretePalette(length(cl_levels), palette = "parade")
+names(cluster_cols) <- cl_levels
+
+png(filename = "umap_pseudo_traj_clusters.png", width = 480, height = 320)
+DimPlot(seurat_pseudo, 
+        group.by = "seurat_clusters", 
+        label = FALSE,
+        cols     = cluster_cols,
+        pt.size = 1) + 
+  theme(plot.title = element_blank()) + 
+  NoAxes()
+dev.off()
+
+png(filename = "umap_pseudo_traj_group.png", width = 480, height = 320)
+DimPlot(seurat_pseudo, 
+        group.by = "group", 
+        label = FALSE,
+        pt.size = 1) + 
+  theme(plot.title = element_blank()) + 
+  NoAxes()
+dev.off()
+
+# Convert file types
+m_counts <- seurat_pseudo@assays$RNA$counts
+m_data <- seurat_pseudo@assays$RNA$data
+sce <- as.SingleCellExperiment(seurat_pseudo, assay = "RNA")
+SummarizedExperiment::assay(sce, "counts")    <- as(m_counts, "dgCMatrix")
+SummarizedExperiment::assay(sce, "logcounts") <- as(m_data,   "dgCMatrix")
+if ("pca"  %in% Reductions(seurat_pseudo)) SingleCellExperiment::reducedDim(sce, "X_pca")  <- Embeddings(seurat_pseudo, "pca")
+if ("umap" %in% Reductions(seurat_pseudo)) SingleCellExperiment::reducedDim(sce, "X_umap") <- Embeddings(seurat_pseudo, "umap")
+zellkonverter::writeH5AD(sce, "pbmc.h5ad")
+
+# PAGA analysis by scanpy via reticulate
+adata <- sc$read_h5ad("pbmc.h5ad")
+adata$obs["seurat_clusters"] <- adata$obs["seurat_clusters"]$astype("category")
+Xp <- adata$obsm$get("X_pca")
+if (py_has_attr(Xp, "values")) {         # pandas.DataFrame -> ndarray
+  Xp <- Xp$values
+}
+Xp <- np$ascontiguousarray(np$asarray(Xp, dtype="float32"))
+adata$obsm$`__setitem__`("X_pca", Xp)
+n_pcs_available <- as.integer(py_to_r(adata$obsm$get("X_pca")$shape[[1]]))
+n_pcs_use <- as.integer(min(30L, n_pcs_available))
+
+sc$pp$neighbors(
+  adata,
+  use_rep    = "X_pca",
+  n_neighbors = as.integer(num_neighbors),
+  n_pcs       = n_pcs_use
+)
+
+sc$tl$paga(adata, groups="seurat_clusters")
+sc$pl$paga(adata, threshold=0.25, show=TRUE)
+
+# Embedding PAGA connection
+coo   <- adata$uns[['paga']][['connectivities']]$tocoo()
+rows  <- py_to_r(coo$row)
+cols  <- py_to_r(coo$col)
+w     <- py_to_r(coo$data)
+cats_py <- adata$obs[['seurat_clusters']]$cat$categories$astype('str')
+cats    <- as.character(py_to_r(cats_py$tolist())) 
+
+edges <- data.frame(
+  source = cats[rows + 1],   # Python 0-index -> R 1-index
+  target = cats[cols + 1],
+  weight = w,
+  stringsAsFactors = FALSE
+)
+edges <- edges[edges$source < edges$target, ]
+edges <- subset(edges, weight >= 0.25)
+
+emb <- Embeddings(seurat_pseudo, "umap") %>% as.data.frame()
+emb$cluster <- as.character(seurat_pseudo$seurat_clusters)
+centroids <- emb %>%
+  group_by(cluster) %>%
+  summarize(UMAP_1 = mean(umap_1), UMAP_2 = mean(umap_2), .groups = "drop")
+edges_plot <- edges %>%
+  left_join(centroids, by = c("source" = "cluster")) %>%
+  rename(x1 = UMAP_1, y1 = UMAP_2) %>%
+  left_join(centroids, by = c("target" = "cluster")) %>%
+  rename(x2 = UMAP_1, y2 = UMAP_2) 
+
+p <- DimPlot(
+  seurat_pseudo,
+  reduction = "umap",
+  group.by  = "seurat_clusters",
+  label     = FALSE,
+  pt.size   = 1,
+  cols     = cluster_cols
+) +
+  theme(plot.title = element_blank())
+
+png(filename = "paga_umap_pseudo_traj.png", width = 480, height = 320)
+p +
+  geom_segment(
+    data = edges_plot,
+    aes(x = x1, y = y1, xend = x2, yend = y2, alpha = weight),
+    linewidth = 2,
+    inherit.aes = FALSE,
+    color = "black",
+    lineend = "round"
+  ) +
+  scale_size(range = c(0.4, 2.4), guide = "none") +
+  scale_alpha(range = c(0.25, 0.9), guide = "none") +
+  NoAxes() 
+dev.off()
+
+# Hierarchical analysis
+emb <- Embeddings(seurat_pseudo, reduction = "umap")[, 1:2]
+meta <- seurat_pseudo@meta.data[, c("nCount_RNA", "seurat_clusters", "group")]
+df <- data.frame(
+  UMAP_1 = emb[,1],
+  UMAP_2 = emb[,2],
+  nCount_RNA = meta$nCount_RNA,
+  seurat_clusters = meta$seurat_clusters,
+  group = meta$group
+)
+df$log10_nCount <- log10(df$nCount_RNA)
+
+p3d_pseudo_cluster <- plot_ly(
+  df,
+  x = ~UMAP_1, y = ~UMAP_2, z = ~log10_nCount,
+  color = ~seurat_clusters, 
+  colors = unname(cluster_cols),          
+  type = "scatter3d", mode = "markers",
+  marker = list(size = 2, opacity = 1)
+) %>% 
+  layout(
+    scene = list(
+      xaxis = list(title = "UMAP 1"),
+      yaxis = list(title = "UMAP 2"),
+      zaxis = list(title = "log10(Total UMI counts)")   
+    ),
+    legend = list(orientation = "h", y = 1.05)
+  )
+
+p3d_pseudo_cluster # choose Zoom
+saveWidget(
+  p3d_pseudo_cluster,
+  file = "/Users/<user_name>/Desktop/zero_eim/zero_final/trajectory_global_clusters_3d_plot.html",
+  selfcontained = TRUE
+)
+
+p3d_pseudo_group <- plot_ly(
+  df,
+  x = ~UMAP_1, y = ~UMAP_2, z = ~log10_nCount,
+  color = ~group,           
+  type = "scatter3d", mode = "markers",
+  marker = list(size = 2, opacity = 1)
+) %>% 
+  layout(
+    scene = list(
+      xaxis = list(title = "UMAP 1"),
+      yaxis = list(title = "UMAP 2"),
+      zaxis = list(title = "log10(Total UMI counts)")   
+    ),
+    legend = list(orientation = "h", y = 1.05)
+  )
+
+p3d_pseudo_group
+saveWidget(
+  p3d_pseudo_group,
+  file = "/Users/<user_name>/Desktop/zero_eim/zero_final/trajectory_global_group_3d_plot.html",
+  selfcontained = TRUE
+)
+
+# Create uniformed subset
+seurat_pseudo_subset <- subset(seurat_pseudo, subset = nCount_RNA > 4000)
+num_neighbors <- floor(seurat_pseudo_subset@assays$RNA@layers$counts@Dim[[2]] / 100)
+
+seurat_pseudo_subset <- NormalizeData(seurat_pseudo_subset, normalization.method = "LogNormalize", scale.factor = 10000)
+seurat_pseudo_subset <- FindVariableFeatures(seurat_pseudo_subset, selection.method = "vst", nfeatures = 2000)
+seurat_pseudo_subset <- ScaleData(seurat_pseudo_subset)
+seurat_pseudo_subset <- RunPCA(seurat_pseudo_subset)
+
+png(filename = "pca_pseudo_traj_subset.png", width = 480, height = 320)
+ElbowPlot(seurat_pseudo_subset, reduction = "pca", ndims = 50)
+dev.off()
+
+seurat_pseudo_subset <- FindNeighbors(seurat_pseudo_subset, dims = 1:30, k.param = num_neighbors)
+seurat_pseudo_subset <- FindClusters(seurat_pseudo_subset, resolution = 1)
+seurat_pseudo_subset <- RunUMAP(seurat_pseudo_subset, dims = 1:30, n.neighbors = num_neighbors)
+
+cl_levels <- levels(seurat_pseudo_subset$seurat_clusters)
+cluster_cols <- Seurat::DiscretePalette(length(cl_levels), palette = "parade")
+names(cluster_cols) <- cl_levels
+
+png(filename = "umap_pseudo_traj_subset_clusters.png", width = 480, height = 320)
+DimPlot(seurat_pseudo_subset, 
+        group.by = "seurat_clusters", 
+        label = FALSE,
+        cols     = cluster_cols,
+        pt.size = 1) + 
+  theme(plot.title = element_blank()) + 
+  NoAxes()
+dev.off()
+
+png(filename = "umap_pseudo_traj_subset_group.png", width = 480, height = 320)
+DimPlot(seurat_pseudo_subset, 
+        group.by = "group", 
+        label = FALSE,
+        pt.size = 1) + 
+  theme(plot.title = element_blank()) + 
+  NoAxes()
+dev.off()
+
+# Convert file types
+m_counts <- seurat_pseudo_subset@assays$RNA$counts
+m_data <- seurat_pseudo_subset@assays$RNA$data
+sce <- as.SingleCellExperiment(seurat_pseudo_subset, assay = "RNA")
+SummarizedExperiment::assay(sce, "counts")    <- as(m_counts, "dgCMatrix")
+SummarizedExperiment::assay(sce, "logcounts") <- as(m_data,   "dgCMatrix")
+if ("pca"  %in% Reductions(seurat_pseudo_subset)) SingleCellExperiment::reducedDim(sce, "X_pca")  <- Embeddings(seurat_pseudo_subset, "pca")
+if ("umap" %in% Reductions(seurat_pseudo_subset)) SingleCellExperiment::reducedDim(sce, "X_umap") <- Embeddings(seurat_pseudo_subset, "umap")
+zellkonverter::writeH5AD(sce, "pbmc.h5ad")
+
+# PAGA analysis by scanpy via reticulate
+adata <- sc$read_h5ad("pbmc.h5ad")
+adata$obs["seurat_clusters"] <- adata$obs["seurat_clusters"]$astype("category")
+Xp <- adata$obsm$get("X_pca")
+if (py_has_attr(Xp, "values")) {         # pandas.DataFrame -> ndarray
+  Xp <- Xp$values
+}
+Xp <- np$ascontiguousarray(np$asarray(Xp, dtype="float32"))
+adata$obsm$`__setitem__`("X_pca", Xp)
+n_pcs_available <- as.integer(py_to_r(adata$obsm$get("X_pca")$shape[[1]]))
+n_pcs_use <- as.integer(min(30L, n_pcs_available))
+
+sc$pp$neighbors(
+  adata,
+  use_rep    = "X_pca",
+  n_neighbors = as.integer(num_neighbors),
+  n_pcs       = n_pcs_use
+)
+
+sc$tl$paga(adata, groups="seurat_clusters")
+sc$pl$paga(adata, threshold=0.25, show=TRUE)
+
+# Embedding PAGA connection
+coo   <- adata$uns[['paga']][['connectivities']]$tocoo()
+rows  <- py_to_r(coo$row)
+cols  <- py_to_r(coo$col)
+w     <- py_to_r(coo$data)
+cats_py <- adata$obs[['seurat_clusters']]$cat$categories$astype('str')
+cats    <- as.character(py_to_r(cats_py$tolist())) 
+
+edges <- data.frame(
+  source = cats[rows + 1],   # Python 0-index -> R 1-index
+  target = cats[cols + 1],
+  weight = w,
+  stringsAsFactors = FALSE
+)
+edges <- edges[edges$source < edges$target, ]
+edges <- subset(edges, weight >= 0.25)
+
+emb <- Embeddings(seurat_pseudo_subset, "umap") %>% as.data.frame()
+emb$cluster <- as.character(seurat_pseudo_subset$seurat_clusters)
+centroids <- emb %>%
+  group_by(cluster) %>%
+  summarize(UMAP_1 = mean(umap_1), UMAP_2 = mean(umap_2), .groups = "drop")
+edges_plot <- edges %>%
+  left_join(centroids, by = c("source" = "cluster")) %>%
+  rename(x1 = UMAP_1, y1 = UMAP_2) %>%
+  left_join(centroids, by = c("target" = "cluster")) %>%
+  rename(x2 = UMAP_1, y2 = UMAP_2) 
+
+p <- DimPlot(
+  seurat_pseudo_subset,
+  reduction = "umap",
+  group.by  = "seurat_clusters",
+  label     = FALSE,
+  pt.size   = 1,
+  cols     = cluster_cols
+) +
+  theme(plot.title = element_blank())
+
+png(filename = "paga_umap_pseudo_traj_subset.png", width = 480, height = 320)
+p +
+  geom_segment(
+    data = edges_plot,
+    aes(x = x1, y = y1, xend = x2, yend = y2, alpha = weight),
+    linewidth = 2,
+    inherit.aes = FALSE,
+    color = "black",
+    lineend = "round",
+    
+  ) +
+  scale_size(range = c(0.4, 2.4), guide = "none") +
+  scale_alpha(range = c(0.25, 0.9), guide = "none") +
+  NoAxes() 
+dev.off()
+
+# Conventional flow in Seurat for pbmc dataset
+seurat_pbmc[["percent.mt"]] <- PercentageFeatureSet(seurat_pbmc, pattern = "^MT-")
+seurat_pbmc_filtered <- subset(seurat_pbmc, subset = percent.mt < 15)
+seurat_pbmc_filtered <- NormalizeData(seurat_pbmc_filtered, normalization.method = "LogNormalize", scale.factor = 10000)
+seurat_pbmc_filtered <- FindVariableFeatures(seurat_pbmc_filtered, selection.method = "vst", nfeatures = 2000)
+seurat_pbmc_filtered <- ScaleData(seurat_pbmc_filtered)
+seurat_pbmc_filtered <- RunPCA(seurat_pbmc_filtered)
+
+png(filename = "pca_global.png", width = 480, height = 320)
+ElbowPlot(seurat_pbmc_filtered, reduction = "pca", ndims = 50)
+dev.off()
+
+seurat_pbmc_filtered <- FindNeighbors(seurat_pbmc_filtered, dims = 1:30, k.param = 30)
+seurat_pbmc_filtered <- FindClusters(seurat_pbmc_filtered, resolution = 1)
+seurat_pbmc_filtered <- RunUMAP(seurat_pbmc_filtered, dims = 1:30, n.neighbors = 30)
+
+cl_levels <- levels(seurat_pbmc_filtered$seurat_clusters)
+cluster_cols <- Seurat::DiscretePalette(length(cl_levels), palette = "parade")
+names(cluster_cols) <- cl_levels
+
+png(filename = "umap_global.png", width = 480, height = 320)
+DimPlot(seurat_pbmc_filtered, 
+        group.by = "seurat_clusters", 
+        label = FALSE,
+        cols     = cluster_cols,
+        pt.size = 1) + 
+  theme(plot.title = element_blank()) + 
+  NoAxes()
+dev.off()
+
+# Hierarchical analysis
+emb <- Embeddings(seurat_pbmc_filtered, reduction = "umap")[, 1:2]
+meta <- seurat_pbmc_filtered@meta.data[, c("nCount_RNA", "seurat_clusters")]
+df <- data.frame(
+  UMAP_1 = emb[,1],
+  UMAP_2 = emb[,2],
+  nCount_RNA = meta$nCount_RNA,
+  seurat_clusters = meta$seurat_clusters
+)
+df$log10_nCount <- log10(df$nCount_RNA)
+
+p3d_global <- plot_ly(
+  df,
+  x = ~UMAP_1, y = ~UMAP_2, z = ~log10_nCount,
+  color = ~seurat_clusters,
+  colors = unname(cluster_cols),
+  type = "scatter3d", mode = "markers",
+  marker = list(size = 2, opacity = 1)
+)  %>% 
+  layout(
+    scene = list(
+      xaxis = list(title = "UMAP 1"),
+      yaxis = list(title = "UMAP 2"),
+      zaxis = list(title = "log10(Total UMI counts)")   
+    ),
+    legend = list(orientation = "h", y = 1.05)
+  )
+
+p3d_global     # choose "Zoom"
+saveWidget(
+  p3d_global,
+  file = "/Users/<user_name>/Desktop/zero_eim/zero_final/pbmc_global_clusters_3d_plot.html",
+  selfcontained = TRUE
+)
+
+# Subset myeloid-derived cells
+markers <- FindAllMarkers(seurat_pbmc_filtered, 
+                          group.by = "seurat_clusters", 
+                          min.pct = 0.75
+)
+
+n_per_cluster <- 3
+top_markers <- markers %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = n_per_cluster, with_ties = FALSE) %>%
+  ungroup()
+
+cluster_levels <- sort(unique(top_markers$cluster))
+features_by_cluster <- lapply(cluster_levels, function(cl) {
+  top_markers$gene[top_markers$cluster == cl]
+})
+features_use <- unique(unlist(features_by_cluster))
+
+png(filename = "deg_global_dot_plot.png", width = 1200, height = 1000)
+DotPlot(
+  seurat_pbmc_filtered,
+  features = features_use,
+  group.by = "seurat_clusters",
+  assay = "RNA"
+) + 
+  RotatedAxis() +
+  ggtitle(paste0("Top ", n_per_cluster, " markers per cluster (DotPlot)")) +
+  labs(x = "Genes", y = "Clusters") + 
+  theme(axis.text.x  = element_text(size = 9))
+dev.off()
+
+myeloid_related_genes <- c("FCER1G", "CTSS", "CTSB")
+
+png(filename = "myeloid_related_genes_global_dot_plot.png", width = 320, height = 1000)
+DotPlot(
+  seurat_pbmc_filtered,
+  features = myeloid_related_genes,
+  group.by = "seurat_clusters",
+  assay = "RNA"
+) + 
+  RotatedAxis() +
+  ggtitle(paste0("Myeloid-derived cell markers")) +
+  labs(x = "Genes", y = "Clusters") + 
+  theme(axis.text.x  = element_text(size = 9))
+dev.off()
+
+# "Putative" monocyte clusters are clusters 0, 4, 5, 10, 12, 13, and 17.
+
+seurat_pbmc_filtered_II <- subset(seurat_pbmc_filtered, 
+                                  subset = seurat_clusters == 0 | 
+                                    seurat_clusters == 4 | 
+                                    seurat_clusters == 5 | 
+                                    seurat_clusters == 10 | 
+                                    seurat_clusters == 12 | 
+                                    seurat_clusters == 13 | 
+                                    seurat_clusters == 17)
+
+# Hierarchical analysis
+emb <- Embeddings(seurat_pbmc_filtered_II, reduction = "umap")[, 1:2]
+meta <- seurat_pbmc_filtered_II@meta.data[, c("nCount_RNA", "seurat_clusters")]
+df <- data.frame(
+  UMAP_1 = emb[,1],
+  UMAP_2 = emb[,2],
+  nCount_RNA = meta$nCount_RNA,
+  seurat_clusters = meta$seurat_clusters
+)
+df$log10_nCount <- log10(df$nCount_RNA)
+x_seq <- seq(min(df$UMAP_1), max(df$UMAP_1), length.out = 2)
+y_seq <- seq(min(df$UMAP_2), max(df$UMAP_2), length.out = 2)
+
+p3d_II_global <- plot_ly(
+  df,
+  x = ~UMAP_1, y = ~UMAP_2, z = ~log10_nCount,
+  color = ~seurat_clusters, 
+  colors = unname(cluster_cols),          
+  type = "scatter3d", mode = "markers",
+  marker = list(size = 2, opacity = 1)
+) %>% 
+  layout(
+    scene = list(
+      xaxis = list(title = "UMAP 1"),
+      yaxis = list(title = "UMAP 2"),
+      zaxis = list(title = "log10(Total UMI counts)")   
+    ),
+    legend = list(orientation = "h", y = 1.05)
+  )
+
+p3d_II_global     # choose "Zoom"
+saveWidget(
+  p3d_II_global,
+  file = "/Users/<user_name>/Desktop/zero_eim/zero_final/pbmc_confused_Mono_subset_of_globalUMAP_clusters_3d_plot.html",
+  selfcontained = TRUE
+)
+
+# Reanalyze "putative" monocyte population
+seurat_pbmc_filtered_II <- NormalizeData(seurat_pbmc_filtered_II, normalization.method = "LogNormalize", scale.factor = 10000)
+seurat_pbmc_filtered_II <- FindVariableFeatures(seurat_pbmc_filtered_II, selection.method = "vst", nfeatures = 2000)
+seurat_pbmc_filtered_II <- ScaleData(seurat_pbmc_filtered_II)
+seurat_pbmc_filtered_II <- RunPCA(seurat_pbmc_filtered_II)
+
+png(filename = "pca_confused_II.png", width = 480, height = 320)
+ElbowPlot(seurat_pbmc_filtered_II, reduction = "pca", ndims = 50)
+dev.off()
+
+seurat_pbmc_filtered_II <- FindNeighbors(seurat_pbmc_filtered_II, dims = 1:30, k.param = 30)
+seurat_pbmc_filtered_II <- FindClusters(seurat_pbmc_filtered_II, resolution = 1)
+seurat_pbmc_filtered_II <- RunUMAP(seurat_pbmc_filtered_II, dims = 1:30, n.neighbors = 30)
+
+cl_levels <- levels(seurat_pbmc_filtered_II$seurat_clusters)
+cluster_cols <- Seurat::DiscretePalette(length(cl_levels), palette = "parade")
+names(cluster_cols) <- cl_levels
+
+png(filename = "umap_confused_II.png", width = 480, height = 320)
+DimPlot(seurat_pbmc_filtered_II, 
+        group.by = "seurat_clusters", 
+        label = FALSE,
+        cols     = cluster_cols,
+        pt.size = 1) + 
+  theme(plot.title = element_blank()) + 
+  NoAxes()
+dev.off()
+
+# DEG analysis
+markers <- FindAllMarkers(seurat_pbmc_filtered_II, 
+                          group.by = "seurat_clusters", 
+                          min.pct = 0.75
+)
+
+n_per_cluster <- 5
+top_markers <- markers %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = n_per_cluster, with_ties = FALSE) %>%
+  ungroup()
+
+cluster_levels <- sort(unique(top_markers$cluster))
+features_by_cluster <- lapply(cluster_levels, function(cl) {
+  top_markers$gene[top_markers$cluster == cl]
+})
+features_use <- unique(unlist(features_by_cluster))
+
+png(filename = "deg_confused_II.png", width = 1000, height = 1000)
+DotPlot(
+  seurat_pbmc_filtered_II,
+  features = features_use,
+  group.by = "seurat_clusters",
+  assay = "RNA"
+) + 
+  RotatedAxis() +
+  ggtitle(paste0("Top ", n_per_cluster, " markers per cluster (DotPlot)")) +
+  labs(x = "Genes", y = "Clusters") + 
+  theme(axis.text.x  = element_text(size = 9))
+dev.off()
+
+# Clusters 6, 8, and 9 are supposed to be doublets composed of monocytes and lymphocytes
+
+# Reanalyze monocyte singlet population
+seurat_pbmc_filtered_II <- subset(seurat_pbmc_filtered_II,
+                                  subset = seurat_clusters != 6 &
+                                           seurat_clusters != 8 &
+                                           seurat_clusters != 9)
+num_neighbors <- floor(seurat_pbmc_filtered_II@assays$RNA@layers$counts@Dim[[2]] / 100)
+
+seurat_pbmc_filtered_II <- NormalizeData(seurat_pbmc_filtered_II, normalization.method = "LogNormalize", scale.factor = 10000)
+seurat_pbmc_filtered_II <- FindVariableFeatures(seurat_pbmc_filtered_II, selection.method = "vst", nfeatures = 2000)
+seurat_pbmc_filtered_II <- ScaleData(seurat_pbmc_filtered_II)
+seurat_pbmc_filtered_II <- RunPCA(seurat_pbmc_filtered_II)
+
+png(filename = "pca_II.png", width = 480, height = 320)
+ElbowPlot(seurat_pbmc_filtered_II, reduction = "pca", ndims = 50)
+dev.off()
+
+seurat_pbmc_filtered_II <- FindNeighbors(seurat_pbmc_filtered_II, dims = 1:30, k.param = num_neighbors)
+seurat_pbmc_filtered_II <- FindClusters(seurat_pbmc_filtered_II, resolution = 1)
+seurat_pbmc_filtered_II <- RunUMAP(seurat_pbmc_filtered_II, dims = 1:30, n.neighbors = num_neighbors)
+
+cl_levels <- levels(seurat_pbmc_filtered_II$seurat_clusters)
+cluster_cols <- Seurat::DiscretePalette(length(cl_levels), palette = "parade")
+names(cluster_cols) <- cl_levels
+
+png(filename = "umap_II.png", width = 480, height = 320)
+DimPlot(seurat_pbmc_filtered_II, 
+        group.by = "seurat_clusters", 
+        label = FALSE,
+        cols     = cluster_cols,
+        pt.size = 1) +
+  theme(plot.title = element_blank()) + 
+  NoAxes()
+dev.off()
+
+# Convert file types
+m_counts <- seurat_pbmc_filtered_II@assays$RNA$counts
+m_data <- seurat_pbmc_filtered_II@assays$RNA$data
+sce <- as.SingleCellExperiment(seurat_pbmc_filtered_II, assay = "RNA")
+SummarizedExperiment::assay(sce, "counts")    <- as(m_counts, "dgCMatrix")
+SummarizedExperiment::assay(sce, "logcounts") <- as(m_data,   "dgCMatrix")
+if ("pca"  %in% Reductions(seurat_pbmc_filtered_II)) SingleCellExperiment::reducedDim(sce, "X_pca")  <- Embeddings(seurat_pbmc_filtered_II, "pca")
+if ("umap" %in% Reductions(seurat_pbmc_filtered_II)) SingleCellExperiment::reducedDim(sce, "X_umap") <- Embeddings(seurat_pbmc_filtered_II, "umap")
+zellkonverter::writeH5AD(sce, "pbmc.h5ad")
+
+# PAGA analysis by scanpy via reticulate
+adata <- sc$read_h5ad("pbmc.h5ad")
+adata$obs["seurat_clusters"] <- adata$obs["seurat_clusters"]$astype("category")
+Xp <- adata$obsm$get("X_pca")
+if (py_has_attr(Xp, "values")) {         # pandas.DataFrame -> ndarray
+  Xp <- Xp$values
+}
+Xp <- np$ascontiguousarray(np$asarray(Xp, dtype="float32"))
+adata$obsm$`__setitem__`("X_pca", Xp)
+n_pcs_available <- as.integer(py_to_r(adata$obsm$get("X_pca")$shape[[1]]))
+n_pcs_use <- as.integer(min(30L, n_pcs_available))
+
+sc$pp$neighbors(
+  adata,
+  use_rep    = "X_pca",
+  n_neighbors = as.integer(num_neighbors),
+  n_pcs       = n_pcs_use
+)
+
+sc$tl$paga(adata, groups="seurat_clusters")
+sc$pl$paga(adata, threshold=0.25, show=TRUE)
+
+# Embedding PAGA connection
+coo   <- adata$uns[['paga']][['connectivities']]$tocoo()
+rows  <- py_to_r(coo$row)
+cols  <- py_to_r(coo$col)
+w     <- py_to_r(coo$data)
+cats_py <- adata$obs[['seurat_clusters']]$cat$categories$astype('str')
+cats    <- as.character(py_to_r(cats_py$tolist())) 
+
+edges <- data.frame(
+  source = cats[rows + 1],   # Python 0-index -> R 1-index
+  target = cats[cols + 1],
+  weight = w,
+  stringsAsFactors = FALSE
+)
+edges <- edges[edges$source < edges$target, ]
+edges <- subset(edges, weight >= 0.25)
+
+emb <- Embeddings(seurat_pbmc_filtered_II, "umap") %>% as.data.frame()
+emb$cluster <- as.character(seurat_pbmc_filtered_II$seurat_clusters)
+centroids <- emb %>%
+  group_by(cluster) %>%
+  summarize(UMAP_1 = mean(umap_1), UMAP_2 = mean(umap_2), .groups = "drop")
+edges_plot <- edges %>%
+  left_join(centroids, by = c("source" = "cluster")) %>%
+  rename(x1 = UMAP_1, y1 = UMAP_2) %>%
+  left_join(centroids, by = c("target" = "cluster")) %>%
+  rename(x2 = UMAP_1, y2 = UMAP_2) 
+
+p <- DimPlot(
+  seurat_pbmc_filtered_II,
+  reduction = "umap",
+  group.by  = "seurat_clusters",
+  label     = FALSE,
+  pt.size   = 1,
+  cols     = cluster_cols
+) +
+  theme(plot.title = element_blank())
+
+png(filename = "paga_umap_II.png", width = 480, height = 320)
+p +
+  geom_segment(
+    data = edges_plot,
+    aes(x = x1, y = y1, xend = x2, yend = y2, alpha = weight),
+    linewidth = 2,
+    inherit.aes = FALSE,
+    color = "black",
+    lineend = "round"
+  ) +
+  scale_size(range = c(0.4, 2.4), guide = "none") +
+  scale_alpha(range = c(0.25, 0.9), guide = "none") +
+  NoAxes() 
+dev.off()
+
+# Hierarchical analysis
+emb <- Embeddings(seurat_pbmc_filtered_II, reduction = "umap")[, 1:2]
+meta <- seurat_pbmc_filtered_II@meta.data[, c("nCount_RNA", "seurat_clusters")]
+df <- data.frame(
+  UMAP_1 = emb[,1],
+  UMAP_2 = emb[,2],
+  nCount_RNA = meta$nCount_RNA,
+  seurat_clusters = meta$seurat_clusters
+)
+df$log10_nCount <- log10(df$nCount_RNA)
+x_seq <- seq(min(df$UMAP_1), max(df$UMAP_1), length.out = 2)
+y_seq <- seq(min(df$UMAP_2), max(df$UMAP_2), length.out = 2)
+low_dim   <- matrix(log10(6000),  nrow = 2, ncol = 2)
+
+p3d_II <- plot_ly(
+  df,
+  x = ~UMAP_1, y = ~UMAP_2, z = ~log10_nCount,
+  color = ~seurat_clusters, 
+  colors = unname(cluster_cols),      
+  type = "scatter3d", mode = "markers",
+  marker = list(size = 2, opacity = 1)
+) %>% 
+  layout(
+    scene = list(
+      xaxis = list(title = "UMAP 1"),
+      yaxis = list(title = "UMAP 2"),
+      zaxis = list(title = "log10(Total UMI counts)")   
+    ),
+    legend = list(orientation = "h", y = 1.05)
+  )
+
+p3d_II_segmented <- plot_ly(
+  df,
+  x = ~UMAP_1, y = ~UMAP_2, z = ~log10_nCount,
+  color = ~seurat_clusters, 
+  colors = unname(cluster_cols),          
+  type = "scatter3d", mode = "markers",
+  marker = list(size = 2, opacity = 1)
+) %>% 
+  add_surface(
+    x = x_seq, y = y_seq, z = low_dim,
+    opacity = 1, showscale = FALSE, name = "z = 6,000 (log10)",
+    showlegend = FALSE
+  ) %>% 
+  layout(
+    scene = list(
+      xaxis = list(title = "UMAP 1"),
+      yaxis = list(title = "UMAP 2"),
+      zaxis = list(title = "log10(Total UMI counts)")   
+    ),
+    legend = list(orientation = "h", y = 1.05)
+  )
+
+p3d_II               # choose "Zoom"
+saveWidget(
+  p3d_II,
+  file = "/Users/<user_name>/Desktop/zero_eim/zero_final/pbmc_Mono_clusters_3d_plot_without_subdim.html",
+  selfcontained = TRUE
+)
+
+p3d_II_segmented     # choose "Zoom"
+saveWidget(
+  p3d_II_segmented,
+  file = "/Users/<user_name>/Desktop/zero_eim/zero_final/pbmc_Mono_clusters_3d_plot_with_subdim.html",
+  selfcontained = TRUE
+)
+
+# DEG analysis
+markers <- FindAllMarkers(seurat_pbmc_filtered_II, 
+                          group.by = "seurat_clusters", 
+                          min.pct = 0.5
+)
+
+n_per_cluster <- 5
+top_markers <- markers %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = n_per_cluster, with_ties = FALSE) %>%
+  ungroup()
+
+cluster_levels <- sort(unique(top_markers$cluster))
+features_by_cluster <- lapply(cluster_levels, function(cl) {
+  top_markers$gene[top_markers$cluster == cl]
+})
+features_use <- unique(unlist(features_by_cluster))
+
+png(filename = "deg_II.png", width = 600, height = 600)
+DotPlot(
+  seurat_pbmc_filtered_II,
+  features = features_use,
+  group.by = "seurat_clusters",
+  assay = "RNA"
+) + 
+  RotatedAxis() +
+  ggtitle(paste0("Top ", n_per_cluster, " markers per cluster (DotPlot)")) +
+  labs(x = "Genes", y = "Clusters") + 
+  theme(axis.text.x  = element_text(size = 9))
+dev.off()
+
+# Compare cells under relatively equal depths
+seurat_pbmc_filtered_II_valid <- subset(seurat_pbmc_filtered_II, subset = nCount_RNA > 10000)
+num_neighbors <- floor(seurat_pbmc_filtered_II_valid@assays$RNA@layers$counts@Dim[[2]] / 100)
+
+seurat_pbmc_filtered_II_valid <- NormalizeData(seurat_pbmc_filtered_II_valid, normalization.method = "LogNormalize", scale.factor = 10000)
+seurat_pbmc_filtered_II_valid <- FindVariableFeatures(seurat_pbmc_filtered_II_valid, selection.method = "vst", nfeatures = 2000)
+seurat_pbmc_filtered_II_valid <- ScaleData(seurat_pbmc_filtered_II_valid)
+seurat_pbmc_filtered_II_valid <- RunPCA(seurat_pbmc_filtered_II_valid)
+
+png(filename = "pca_II_valid.png", width = 480, height = 320)
+ElbowPlot(seurat_pbmc_filtered_II_valid, reduction = "pca", ndims = 50)
+dev.off()
+
+seurat_pbmc_filtered_II_valid <- FindNeighbors(seurat_pbmc_filtered_II_valid, dims = 1:30, k.param = num_neighbors)
+seurat_pbmc_filtered_II_valid <- FindClusters(seurat_pbmc_filtered_II_valid, resolution = 1)
+seurat_pbmc_filtered_II_valid <- RunUMAP(seurat_pbmc_filtered_II_valid, dims = 1:30, n.neighbors = num_neighbors)
+
+cl_levels <- levels(seurat_pbmc_filtered_II_valid$seurat_clusters)
+cluster_cols <- Seurat::DiscretePalette(length(cl_levels), palette = "parade")
+names(cluster_cols) <- cl_levels
+
+png(filename = "umap_II_valid.png", width = 480, height = 320)
+DimPlot(seurat_pbmc_filtered_II_valid, 
+        group.by = "seurat_clusters", 
+        label = FALSE,
+        cols     = cluster_cols,
+        pt.size = 1) +
+  theme(plot.title = element_blank()) +
+  NoAxes() 
+dev.off()
+
+# Hierarchical analysis
+emb <- Embeddings(seurat_pbmc_filtered_II_valid, reduction = "umap")[, 1:2]
+meta <- seurat_pbmc_filtered_II_valid@meta.data[, c("nCount_RNA", "seurat_clusters")]
+df <- data.frame(
+  UMAP_1 = emb[,1],
+  UMAP_2 = emb[,2],
+  nCount_RNA = meta$nCount_RNA,
+  seurat_clusters = meta$seurat_clusters
+)
+df$log10_nCount <- log10(df$nCount_RNA)
+
+p3d_II_valid <- plot_ly(
+  df,
+  x = ~UMAP_1, y = ~UMAP_2, z = ~log10_nCount,
+  color = ~seurat_clusters, 
+  colors = unname(cluster_cols),          
+  type = "scatter3d", mode = "markers",
+  marker = list(size = 2, opacity = 1)
+) %>% 
+  layout(
+    scene = list(
+      xaxis = list(title = "UMAP 1"),
+      yaxis = list(title = "UMAP 2"),
+      zaxis = list(title = "log10(Total UMI counts)")   
+    ),
+    legend = list(orientation = "h", y = 1.05)
+  )
+
+p3d_II_valid     # Choose "zoom"
+saveWidget(
+  p3d_II_valid,
+  file = "/Users/<user_name>/Desktop/zero_eim/zero_final/pbmc_good_UMI_Mono_clusters_3d_plot.html",
+  selfcontained = TRUE
+)
+
+# Convert file types
+m_counts <- seurat_pbmc_filtered_II_valid@assays$RNA$counts
+m_data <- seurat_pbmc_filtered_II_valid@assays$RNA$data
+sce <- as.SingleCellExperiment(seurat_pbmc_filtered_II_valid, assay = "RNA")
+SummarizedExperiment::assay(sce, "counts")    <- as(m_counts, "dgCMatrix")
+SummarizedExperiment::assay(sce, "logcounts") <- as(m_data,   "dgCMatrix")
+if ("pca"  %in% Reductions(seurat_pbmc_filtered_II_valid)) SingleCellExperiment::reducedDim(sce, "X_pca")  <- Embeddings(seurat_pbmc_filtered_II_valid, "pca")
+if ("umap" %in% Reductions(seurat_pbmc_filtered_II_valid)) SingleCellExperiment::reducedDim(sce, "X_umap") <- Embeddings(seurat_pbmc_filtered_II_valid, "umap")
+zellkonverter::writeH5AD(sce, "pbmc.h5ad")
+
+# PAGA analysis by scanpy via reticulate
+adata <- sc$read_h5ad("pbmc.h5ad")
+adata$obs["seurat_clusters"] <- adata$obs["seurat_clusters"]$astype("category")
+Xp <- adata$obsm$get("X_pca")
+if (py_has_attr(Xp, "values")) {         # pandas.DataFrame -> ndarray
+  Xp <- Xp$values
+}
+Xp <- np$ascontiguousarray(np$asarray(Xp, dtype="float32"))
+adata$obsm$`__setitem__`("X_pca", Xp)
+n_pcs_available <- as.integer(py_to_r(adata$obsm$get("X_pca")$shape[[1]]))
+n_pcs_use <- as.integer(min(30L, n_pcs_available))
+
+sc$pp$neighbors(
+  adata,
+  use_rep    = "X_pca",
+  n_neighbors = as.integer(num_neighbors),
+  n_pcs       = n_pcs_use
+)
+
+sc$tl$paga(adata, groups="seurat_clusters")
+sc$pl$paga(adata, threshold=0.25, show=TRUE)
+
+# Embedding PAGA connection
+coo   <- adata$uns[['paga']][['connectivities']]$tocoo()
+rows  <- py_to_r(coo$row)
+cols  <- py_to_r(coo$col)
+w     <- py_to_r(coo$data)
+cats_py <- adata$obs[['seurat_clusters']]$cat$categories$astype('str')
+cats    <- as.character(py_to_r(cats_py$tolist())) 
+
+edges <- data.frame(
+  source = cats[rows + 1],   # Python 0-index -> R 1-index
+  target = cats[cols + 1],
+  weight = w,
+  stringsAsFactors = FALSE
+)
+edges <- edges[edges$source < edges$target, ]
+edges <- subset(edges, weight >= 0.25)
+
+emb <- Embeddings(seurat_pbmc_filtered_II_valid, "umap") %>% as.data.frame()
+emb$cluster <- as.character(seurat_pbmc_filtered_II_valid$seurat_clusters)
+centroids <- emb %>%
+  group_by(cluster) %>%
+  summarize(UMAP_1 = mean(umap_1), UMAP_2 = mean(umap_2), .groups = "drop")
+edges_plot <- edges %>%
+  left_join(centroids, by = c("source" = "cluster")) %>%
+  rename(x1 = UMAP_1, y1 = UMAP_2) %>%
+  left_join(centroids, by = c("target" = "cluster")) %>%
+  rename(x2 = UMAP_1, y2 = UMAP_2) 
+
+p <- DimPlot(
+  seurat_pbmc_filtered_II_valid,
+  reduction = "umap",
+  group.by  = "seurat_clusters",
+  label     = FALSE,
+  pt.size   = 1,
+  cols     = cluster_cols
+) +
+  theme(plot.title = element_blank())
+
+png(filename = "paga_umap_II_valid.png", width = 480, height = 320)
+p +
+  geom_segment(
+    data = edges_plot,
+    aes(x = x1, y = y1, xend = x2, yend = y2, alpha = weight),
+    linewidth = 2,
+    inherit.aes = FALSE,
+    color = "black",
+    lineend = "round",
+    
+  ) +
+  scale_size(range = c(0.4, 2.4), guide = "none") +
+  scale_alpha(range = c(0.25, 0.9), guide = "none") +
+  NoAxes() 
+dev.off()
+
+# DEG analysis
+markers <- FindAllMarkers(seurat_pbmc_filtered_II_valid, 
+                          group.by = "seurat_clusters", 
+                          min.pct = 0.5
+)
+
+n_per_cluster <- 10
+top_markers <- markers %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = n_per_cluster, with_ties = FALSE) %>%
+  ungroup()
+
+cluster_levels <- sort(unique(top_markers$cluster))
+features_by_cluster <- lapply(cluster_levels, function(cl) {
+  top_markers$gene[top_markers$cluster == cl]
+})
+features_use <- unique(unlist(features_by_cluster))
+
+png(filename = "deg_II_valid.png", width = 800, height = 600)
+DotPlot(
+  seurat_pbmc_filtered_II_valid,
+  features = features_use,
+  group.by = "seurat_clusters",
+  assay = "RNA"
+) + 
+  RotatedAxis() +
+  ggtitle(paste0("Top ", n_per_cluster, " markers per cluster (DotPlot)")) +
+  labs(x = "Genes", y = "Clusters") + 
+  theme(axis.text.x  = element_text(size = 9))
+dev.off()
+
+ISG_genes <- c("IFIT1", "IFIT2", "OASL", "MX1")
+CM_genes <- c("CD14", "VCAN", "S100A8", "S100A9", "CCR2", "LYZ")
+HLA_genes <- c("HLA-DQA1", "HLA-DPA1", "HLA-DRA", "HLA-DMA", "HLA-DPB1", "HLA-DRB1", "CD74", "CIITA")
+NCM_genes <- c("FCGR3A", "SIGLEC10", "NR4A1", "CX3CR1")
+moDC_genes <- c("CD1E", "CLEC10A")
+
+png(filename = "final_feature_plot_ISG.png", width = 480, height = 480)
+FeaturePlot(seurat_pbmc_filtered_II_valid,
+            features = ISG_genes,
+            ncol = 2,
+            pt.size = 1) & 
+  NoAxes()
+dev.off()
+
+png(filename = "final_dot_plot_ISG.png", width = 360, height = 480)
+DotPlot(seurat_pbmc_filtered_II_valid,
+        features = ISG_genes) 
+dev.off()
+
+png(filename = "final_feature_plot_CM.png", width = 720, height = 480)
+FeaturePlot(seurat_pbmc_filtered_II_valid,
+            features = CM_genes,
+            ncol = 3,
+            pt.size = 1) & 
+  NoAxes()
+dev.off()
+
+png(filename = "final_dot_plot_CM.png", width = 540, height = 480)
+DotPlot(seurat_pbmc_filtered_II_valid,
+        features = CM_genes) 
+dev.off()
+
+png(filename = "final_feature_plot_HLA.png", width = 960, height = 480)
+FeaturePlot(seurat_pbmc_filtered_II_valid,
+            features = HLA_genes,
+            ncol = 4,
+            pt.size = 1) & 
+  NoAxes()
+dev.off()
+
+png(filename = "final_dot_plot_HLA.png", width = 720, height = 480)
+DotPlot(seurat_pbmc_filtered_II_valid,
+        features = HLA_genes) 
+dev.off()
+
+png(filename = "final_feature_plot_NCM.png", width = 480, height = 480)
+FeaturePlot(seurat_pbmc_filtered_II_valid,
+            features = NCM_genes,
+            ncol = 2,
+            pt.size = 1) & 
+  NoAxes()
+dev.off()
+
+png(filename = "final_dot_plot_NCM.png", width = 480, height = 480)
+DotPlot(seurat_pbmc_filtered_II_valid,
+        features = NCM_genes) 
+dev.off()
+
+png(filename = "final_feature_plot_moDC.png", width = 240, height = 480)
+FeaturePlot(seurat_pbmc_filtered_II_valid,
+            features = moDC_genes,
+            ncol = 1,
+            pt.size = 1) & 
+  NoAxes()
+dev.off()
+
+png(filename = "final_dot_plot_moDC.png", width = 480, height = 480)
+DotPlot(seurat_pbmc_filtered_II_valid,
+        features = NCM_genes) 
+dev.off()
+
+# Lineage estimation
+seu_all   <- seurat_pbmc_filtered_II
+seu_valid <- seurat_pbmc_filtered_II_valid
+valid_cells <- colnames(seu_valid)
+valid_clusters <- as.character(seu_valid$seurat_clusters)
+cluster_annotation <- c(
+  "0" = "IFN-stimulated Monocytes",
+  "1" = "Classical Monocytes",
+  "2" = "Basal Monocytes",
+  "3" = "Intermediate Monocytes",
+  "4" = "Exhausted Monocytes",
+  "5" = "Monocyte-derived DC Progenitors",
+  "6" = "Nonclassical Monocytes"
+)
+valid_labels <- cluster_annotation[valid_clusters]
+
+all_cells <- colnames(seu_all)
+annotation <- rep("Informational Loss", length(all_cells))
+names(annotation) <- all_cells
+annotation[valid_cells] <- valid_labels
+
+seu_all$InfoAnnotation <- annotation
+seu_valid$InfoAnnotation <- annotation[colnames(seu_valid)]
+DimPlot(seu_all,
+        group.by = "InfoAnnotation",
+        pt.size = 1) +
+  theme(plot.title = element_blank()) +
+  NoAxes() 
+
+num_neighbors <- floor(seu_all@assays$RNA@layers$counts@Dim[[2]] / 100)
+
+# Convert file types
+m_counts <- seu_all@assays$RNA$counts
+m_data <- seu_all@assays$RNA$data
+sce <- as.SingleCellExperiment(seu_all, assay = "RNA")
+SummarizedExperiment::assay(sce, "counts")    <- as(m_counts, "dgCMatrix")
+SummarizedExperiment::assay(sce, "logcounts") <- as(m_data,   "dgCMatrix")
+if ("pca"  %in% Reductions(seu_all)) SingleCellExperiment::reducedDim(sce, "X_pca")  <- Embeddings(seu_all, "pca")
+if ("umap" %in% Reductions(seu_all)) SingleCellExperiment::reducedDim(sce, "X_umap") <- Embeddings(seu_all, "umap")
+zellkonverter::writeH5AD(sce, "pbmc.h5ad")
+
+# PAGA analysis by scanpy via reticulate
+adata <- sc$read_h5ad("pbmc.h5ad")
+adata$obs["InfoAnnotation"] <- adata$obs["InfoAnnotation"]$astype("category")
+Xp <- adata$obsm$get("X_pca")
+if (py_has_attr(Xp, "values")) {         # pandas.DataFrame -> ndarray
+  Xp <- Xp$values
+}
+Xp <- np$ascontiguousarray(np$asarray(Xp, dtype="float32"))
+adata$obsm$`__setitem__`("X_pca", Xp)
+n_pcs_available <- as.integer(py_to_r(adata$obsm$get("X_pca")$shape[[1]]))
+n_pcs_use <- as.integer(min(30L, n_pcs_available))
+
+sc$pp$neighbors(
+  adata,
+  use_rep    = "X_pca",
+  n_neighbors = as.integer(num_neighbors),
+  n_pcs       = n_pcs_use
+)
+
+sc$tl$paga(adata, groups="InfoAnnotation")
+sc$pl$paga(adata, threshold=0.25, show=TRUE)
+
+# Embedding PAGA connection
+coo   <- adata$uns[['paga']][['connectivities']]$tocoo()
+rows  <- py_to_r(coo$row)
+cols  <- py_to_r(coo$col)
+w     <- py_to_r(coo$data)
+cats_py <- adata$obs[['InfoAnnotation']]$cat$categories$astype('str')
+cats    <- as.character(py_to_r(cats_py$tolist())) 
+
+edges <- data.frame(
+  source = cats[rows + 1],   # Python 0-index -> R 1-index
+  target = cats[cols + 1],
+  weight = w,
+  stringsAsFactors = FALSE
+)
+edges <- edges[edges$source < edges$target, ]
+edges <- subset(edges, weight >= 0.25)
+
+emb <- Embeddings(seu_all, "umap") %>% as.data.frame()
+emb$cluster <- as.character(seu_all$InfoAnnotation)
+centroids <- emb %>%
+  group_by(cluster) %>%
+  summarize(UMAP_1 = mean(umap_1), UMAP_2 = mean(umap_2), .groups = "drop")
+edges_plot <- edges %>%
+  left_join(centroids, by = c("source" = "cluster")) %>%
+  rename(x1 = UMAP_1, y1 = UMAP_2) %>%
+  left_join(centroids, by = c("target" = "cluster")) %>%
+  rename(x2 = UMAP_1, y2 = UMAP_2) 
+
+p <- DimPlot(
+  seu_all,
+  reduction = "umap",
+  group.by  = "InfoAnnotation",
+  label     = FALSE,
+  pt.size   = 1
+) +
+  theme(plot.title = element_blank())
+
+png(filename = "paga_umap_II_XY.png", width = 480, height = 320)
+p +
+  geom_segment(
+    data = edges_plot,
+    aes(x = x1, y = y1, xend = x2, yend = y2, alpha = weight),
+    linewidth = 2,
+    inherit.aes = FALSE,
+    color = "black",
+    lineend = "round"
+  ) +
+  scale_size(range = c(0.4, 2.4), guide = "none") +
+  scale_alpha(range = c(0.25, 0.9), guide = "none") +
+  NoAxes() 
+dev.off()
+
+# confirm non-linear relevance among better annotations under distorted linear analysis
+seu_all$cell_barcode <- colnames(seu_all)
+seu_nonline <- subset(seu_all, subset = cell_barcode %in% valid_cells)
+num_neighbors <- floor(seu_nonline@assays$RNA@layers$counts@Dim[[2]] / 100)
+seu_nonline <- FindNeighbors(seu_nonline, dims = 1:30, k.param = num_neighbors)
+seu_nonline <- FindClusters(seu_nonline, resolution = 1)
+seu_nonline <- RunUMAP(seu_nonline, dims = 1:30, n.neighbors = num_neighbors)
+
+cl_levels <- unique(seu_nonline$InfoAnnotation)
+cluster_cols <- Seurat::DiscretePalette(length(cl_levels), palette = "parade")
+names(cluster_cols) <- cl_levels
+
+png(filename = "umap_II_valid_reanalyzed_with_PCA_in_all.png", width = 480, height = 320)
+DimPlot(seu_nonline, 
+        group.by = "InfoAnnotation", 
+        label = FALSE,
+        cols     = cluster_cols,
+        pt.size = 1) +
+  theme(plot.title = element_blank()) +
+  NoAxes() 
+dev.off()
+
+# Convert file types
+m_counts <- seu_nonline@assays$RNA$counts
+m_data <- seu_nonline@assays$RNA$data
+sce <- as.SingleCellExperiment(seu_nonline, assay = "RNA")
+SummarizedExperiment::assay(sce, "counts")    <- as(m_counts, "dgCMatrix")
+SummarizedExperiment::assay(sce, "logcounts") <- as(m_data,   "dgCMatrix")
+if ("pca"  %in% Reductions(seu_nonline)) SingleCellExperiment::reducedDim(sce, "X_pca")  <- Embeddings(seu_nonline, "pca")
+if ("umap" %in% Reductions(seu_nonline)) SingleCellExperiment::reducedDim(sce, "X_umap") <- Embeddings(seu_nonline, "umap")
+zellkonverter::writeH5AD(sce, "pbmc.h5ad")
+
+# PAGA analysis by scanpy via reticulate
+adata <- sc$read_h5ad("pbmc.h5ad")
+adata$obs["InfoAnnotation"] <- adata$obs["InfoAnnotation"]$astype("category")
+Xp <- adata$obsm$get("X_pca")
+if (py_has_attr(Xp, "values")) {         # pandas.DataFrame -> ndarray
+  Xp <- Xp$values
+}
+Xp <- np$ascontiguousarray(np$asarray(Xp, dtype="float32"))
+adata$obsm$`__setitem__`("X_pca", Xp)
+n_pcs_available <- as.integer(py_to_r(adata$obsm$get("X_pca")$shape[[1]]))
+n_pcs_use <- as.integer(min(30L, n_pcs_available))
+
+sc$pp$neighbors(
+  adata,
+  use_rep    = "X_pca",
+  n_neighbors = as.integer(num_neighbors),
+  n_pcs       = n_pcs_use
+)
+
+sc$tl$paga(adata, groups="InfoAnnotation")
+sc$pl$paga(adata, threshold=0.2, show=TRUE)   # slightly lower than others
+
+# Embedding PAGA connection
+coo   <- adata$uns[['paga']][['connectivities']]$tocoo()
+rows  <- py_to_r(coo$row)
+cols  <- py_to_r(coo$col)
+w     <- py_to_r(coo$data)
+cats_py <- adata$obs[['InfoAnnotation']]$cat$categories$astype('str')
+cats    <- as.character(py_to_r(cats_py$tolist())) 
+
+edges <- data.frame(
+  source = cats[rows + 1],   # Python 0-index -> R 1-index
+  target = cats[cols + 1],
+  weight = w,
+  stringsAsFactors = FALSE
+)
+edges <- edges[edges$source < edges$target, ]
+edges <- subset(edges, weight >= 0.2)    # slightly lower than others for visualization
+
+emb <- Embeddings(seu_nonline, "umap") %>% as.data.frame()
+emb$cluster <- as.character(seu_nonline$InfoAnnotation)
+centroids <- emb %>%
+  group_by(cluster) %>%
+  summarize(UMAP_1 = mean(umap_1), UMAP_2 = mean(umap_2), .groups = "drop")
+edges_plot <- edges %>%
+  left_join(centroids, by = c("source" = "cluster")) %>%
+  rename(x1 = UMAP_1, y1 = UMAP_2) %>%
+  left_join(centroids, by = c("target" = "cluster")) %>%
+  rename(x2 = UMAP_1, y2 = UMAP_2) 
+
+p <- DimPlot(
+  seu_nonline,
+  reduction = "umap",
+  group.by  = "InfoAnnotation",
+  label     = FALSE,
+  pt.size   = 1
+) +
+  theme(plot.title = element_blank())
+
+png(filename = "paga_umap_II_valid_reanalyzed_with_PCA_in_all(thre02).png", width = 480, height = 320)
+p +
+  geom_segment(
+    data = edges_plot,
+    aes(x = x1, y = y1, xend = x2, yend = y2, alpha = weight),
+    linewidth = 2,
+    inherit.aes = FALSE,
+    color = "black",
+    lineend = "round"
+  ) +
+  scale_size(range = c(0.4, 2.4), guide = "none") +
+  scale_alpha(range = c(0.25, 0.9), guide = "none") +
+  NoAxes() +
+  labs(caption = "A threshold of connectivity to show is slightly lower (0.20) than in other panels (0.25) for visualization.") +
+  theme(
+    plot.caption = element_text(hjust = 0, size = 10),
+    plot.caption.position = "plot"
+  )
+dev.off()
+
+# Remove "back-doors"
+n_walks <- 100        # number of random walks per cell (k)
+T_max   <- 5       # maximum steps per walk (T)
+info_loss_label <- "Informational Loss"
+info_annot <- seu_all$InfoAnnotation
+cell_names <- colnames(seu_all)
+is_labeled <- info_annot != info_loss_label
+label_vec  <- info_annot           # biological labels or "Informational Loss"
+bio_labels <- sort(unique(label_vec[is_labeled]))
+K <- length(bio_labels)
+
+# Extract SNN graph and construct transition probabilities
+graph_name <- grep("_snn$", names(seu_all@graphs), value = TRUE)[1]
+A <- seu_all@graphs[[graph_name]]  # dgCMatrix adjacency matrix
+diag(A) <- 0    # remove self-loop 
+A_col <- t(A) 
+n_cells <- ncol(A_col)
+stopifnot(identical(colnames(A_col), cell_names))     # Sanity check: column order should match cell_names
+neighbors_list <- vector("list", n_cells)
+probs_list     <- vector("list", n_cells)
+
+# dgCMatrix is column-compressed:
+#  - @p: pointers to start of each column (length ncol + 1)
+#  - @i: row indices (0-based)
+#  - @x: non-zero values
+for (j in seq_len(n_cells)) {
+  col_start <- A_col@p[j] + 1
+  col_end   <- A_col@p[j + 1]
+  
+  if (col_end >= col_start) {
+    rows <- A_col@i[col_start:col_end] + 1  # row indices (1-based)
+    w    <- A_col@x[col_start:col_end]      # edge weights
+    neighbors_list[[j]] <- rows
+    probs_list[[j]]     <- w / sum(w)
+  } else {
+    neighbors_list[[j]] <- integer(0)
+    probs_list[[j]]     <- numeric(0)
+  }
+}
+
+# Map cell name -> index
+cell_index <- seq_len(n_cells)
+names(cell_index) <- colnames(A_col)
+
+# Random walk function: first-hit to labeled cell
+random_walk_first_hit <- function(start_idx, neighbors_list, probs_list,
+                                  is_labeled, label_vec, T_max) {
+  current <- start_idx
+  
+  for (t in seq_len(T_max)) {
+    neigh <- neighbors_list[[current]]
+    if (length(neigh) == 0L) {
+      # dead end: no outgoing edges
+      return(NA_character_)
+    }
+    # sample next node
+    current <- sample(neigh, size = 1L, prob = probs_list[[current]])
+    
+    # if we hit a labeled cell, return its biological label
+    if (is_labeled[current]) {
+      return(label_vec[current])
+    }
+  }
+  
+  # no labeled cell reached within T_max steps
+  return(NA_character_)
+}
+
+# Compute reliability for Informational Loss cells
+# Initialize result vectors
+Reliability <- rep(NA_real_, n_cells)
+HitRate     <- rep(NA_real_, n_cells)
+Sharpness   <- rep(NA_real_, n_cells)
+
+names(Reliability) <- cell_names
+names(HitRate)     <- cell_names
+names(Sharpness)   <- cell_names
+loss_cells <- which(!is_labeled)     # Indices of Informational Loss cells
+
+# Progress message
+message(sprintf("Number of Informational Loss cells: %d", length(loss_cells)))
+message(sprintf("Running %d random walks per cell, max %d steps each.", n_walks, T_max))
+
+for (idx in loss_cells) {
+  start_name <- cell_names[idx]
+  
+  # Run random walks
+  hits <- character(n_walks)
+  for (w in seq_len(n_walks)) {
+    hits[w] <- random_walk_first_hit(
+      start_idx      = idx,
+      neighbors_list = neighbors_list,
+      probs_list     = probs_list,
+      is_labeled     = is_labeled,
+      label_vec      = label_vec,
+      T_max          = T_max
+    )
+  }
+  
+  # Separate hit vs no-hit
+  hit_labels <- hits[!is.na(hits)]
+  s <- length(hit_labels)     # total hits
+  r <- s / n_walks            # hit rate
+  
+  HitRate[idx] <- r
+  
+  if (s == 0L) {
+    # no hits → Reliability = 0, Sharpness = 0
+    Reliability[idx] <- 0
+    Sharpness[idx]   <- 0
+  } else {
+    # empirical distribution over biological labels
+    tab <- table(hit_labels)
+    p   <- as.numeric(tab) / s
+    
+    # conditional entropy
+    H_cond <- -sum(p * log(p))
+    
+    # normalized sharpness S = 1 - H_cond / log(K)
+    S <- 1 - H_cond / log(K)
+
+    Sharpness[idx] <- S
+    Reliability[idx] <- r * S
+  }
+}
+
+# For labeled cells, set to 1.
+Reliability[is_labeled] <- NA
+HitRate[is_labeled]     <- NA
+Sharpness[is_labeled]   <- NA
+
+# Store into meta.data
+seu_all$RW_Reliability <- Reliability
+seu_all$RW_HitRate     <- HitRate
+seu_all$RW_Sharpness   <- Sharpness
+
+# Reliability of Informational Loss cells on UMAP
+FeaturePlot(
+  seu_all,
+  features = "RW_HitRate",
+  reduction = "umap"
+) +
+  theme(plot.title = element_blank()) +
+  NoAxes()
+
+FeaturePlot(
+  seu_all,
+  features = "RW_Sharpness",
+  reduction = "umap"
+) +
+  theme(plot.title = element_blank()) +
+  NoAxes()
+
+FeaturePlot(
+  seu_all,
+  features = "RW_Reliability",
+  reduction = "umap"
+) +
+  theme(plot.title = element_blank()) +
+  NoAxes()
+
+seu_loss <- subset(seu_all, subset = InfoAnnotation == "Informational Loss")
+FeatureScatter(seu_loss,
+               feature1 = "nCount_RNA",
+               feature2 = "RW_HitRate",
+               group.by = "seurat_clusters") +
+  theme(plot.title = element_blank())
+
+FeatureScatter(seu_loss,
+               feature1 = "nCount_RNA",
+               feature2 = "RW_Reliability",
+               group.by = "seurat_clusters") +
+  theme(plot.title = element_blank())
+
+# Optimize sample sets
+meta_loss <- seu_loss@meta.data
+thr <- 0.05 # connectivity threshold (to analyze the detailed topology in PAGA results considering weak connectivities)
+k_values   <- seq(0, 100, by = 5)
+
+betti_list <- vector("list", length(k_values))
+
+for (i in seq_along(k_values)) {
+  k <- k_values[i]
+  message("Processing k = ", k)
+  
+  if (k == 0){th_HitRate <- -Inf} else {th_HitRate  <- quantile(meta_loss$RW_HitRate, probs = k / 100, na.rm = TRUE)}
+  not_to_keep <- meta_loss$RW_HitRate <= th_HitRate
+  bad_cells <- rownames(meta_loss)[not_to_keep]
+  seu_reliable <- subset(seu_all, cells = setdiff(colnames(seu_all), bad_cells))
+  num_neighbors <- floor(seu_reliable@assays$RNA@layers$counts@Dim[[2]] / 100)
+  seu_reliable <- NormalizeData(seu_reliable, normalization.method = "LogNormalize", scale.factor = 10000, verbose = FALSE)
+  seu_reliable <- FindVariableFeatures(seu_reliable, selection.method = "vst", nfeatures = 2000, verbose = FALSE)
+  seu_reliable <- ScaleData(seu_reliable, verbose = FALSE)
+  seu_reliable <- RunPCA(seu_reliable, verbose = FALSE)
+  seu_reliable <- FindNeighbors(seu_reliable, dims = 1:30, k.param = num_neighbors, verbose = FALSE)
+  seu_reliable <- FindClusters(seu_reliable, resolution = 1, verbose = FALSE)
+  seu_reliable <- RunUMAP(seu_reliable, dims = 1:30, n.neighbors = num_neighbors, verbose = FALSE)
+  
+  m_counts <- GetAssayData(seu_reliable, assay = "RNA", slot = "counts")
+  m_data   <- GetAssayData(seu_reliable, assay = "RNA", slot = "data")
+  sce <- as.SingleCellExperiment(seu_reliable, assay = "RNA")
+  SummarizedExperiment::assay(sce, "counts")    <- as(m_counts, "dgCMatrix")
+  SummarizedExperiment::assay(sce, "logcounts") <- as(m_data,   "dgCMatrix")
+  if ("pca" %in% Reductions(seu_reliable)) {SingleCellExperiment::reducedDim(sce, "X_pca") <- Embeddings(seu_reliable, "pca")}
+  if ("umap" %in% Reductions(seu_reliable)) {SingleCellExperiment::reducedDim(sce, "X_umap") <- Embeddings(seu_reliable, "umap")}
+  zellkonverter::writeH5AD(sce, "pbmc.h5ad")
+  
+  adata <- sc$read_h5ad("pbmc.h5ad")
+  adata$obs["seurat_clusters"] <- adata$obs["seurat_clusters"]$astype("category")
+  Xp <- adata$obsm$get("X_pca")
+  if (py_has_attr(Xp, "values")) {         # pandas.DataFrame -> ndarray
+    Xp <- Xp$values
+  }
+  Xp <- np$ascontiguousarray(np$asarray(Xp, dtype="float32"))
+  adata$obsm$`__setitem__`("X_pca", Xp)
+  n_pcs_available <- as.integer(py_to_r(adata$obsm$get("X_pca")$shape[[1]]))
+  n_pcs_use <- as.integer(min(30L, n_pcs_available))
+  
+  sc$pp$neighbors(
+    adata,
+    use_rep    = "X_pca",
+    n_neighbors = as.integer(num_neighbors),
+    n_pcs       = n_pcs_use
+  )
+  sc$tl$paga(adata, groups="seurat_clusters")
+  
+  paga_conn <- adata$uns[['paga']][['connectivities']]
+  paga_mat <- py_to_r(paga_conn$toarray())
+  paga_mat[paga_mat < thr] <- 0
+  g <- igraph::graph_from_adjacency_matrix(
+    paga_mat,
+    mode    = "undirected", 
+    weighted = TRUE,
+    diag     = FALSE
+  )
+  g <- igraph::simplify(g, remove.multiple = TRUE, remove.loops = TRUE)
+  comp  <- igraph::components(g)
+  beta0 <- comp$no
+  V <- igraph::vcount(g)
+  E <- igraph::ecount(g)
+  beta1 <- E - V + beta0  
+  
+  betti_list[[i]] <- data.frame(
+    k        = k,
+    num_clusters = V,
+    beta0    = beta0,
+    beta1    = beta1,
+    stringsAsFactors = FALSE
+  )
+}
+
+betti_df <- do.call(rbind, betti_list)
+valid_beta1 <- betti_df$beta1[betti_df$k == 100]
+
+k <- min(betti_df$k[betti_df$beta1 == valid_beta1]) # optimized k
+
+# Optimized estimation with reliable cells
+th_HitRate  <- quantile(meta_loss$RW_HitRate, probs = k / 100, na.rm = TRUE)
+not_to_keep <- (meta_loss$RW_HitRate <= th_HitRate)
+bad_cells <- rownames(meta_loss)[not_to_keep]
+seu_reliable <- subset(seu_all, cells = setdiff(colnames(seu_all), bad_cells))
+num_neighbors <- floor(seu_reliable@assays$RNA@layers$counts@Dim[[2]] / 100)
+
+seu_reliable <- NormalizeData(seu_reliable, normalization.method = "LogNormalize", scale.factor = 10000)
+seu_reliable <- FindVariableFeatures(seu_reliable, selection.method = "vst", nfeatures = 2000)
+seu_reliable <- ScaleData(seu_reliable)
+seu_reliable <- RunPCA(seu_reliable)
+
+png(filename = "pca_reliable.png", width = 480, height = 320)
+ElbowPlot(seu_reliable, reduction = "pca", ndims = 50)
+dev.off()
+
+seu_reliable <- FindNeighbors(seu_reliable, dims = 1:30, k.param = num_neighbors)
+seu_reliable <- FindClusters(seu_reliable, resolution = 1)
+seu_reliable <- RunUMAP(seu_reliable, dims = 1:30, n.neighbors = num_neighbors)
+
+cl_levels <- levels(seu_reliable$seurat_clusters)
+cluster_cols <- Seurat::DiscretePalette(length(cl_levels), palette = "parade")
+names(cluster_cols) <- cl_levels
+
+png(filename = "umap_reliable.png", width = 480, height = 320)
+DimPlot(seu_reliable, 
+        group.by = "seurat_clusters", 
+        label = FALSE,
+        cols     = cluster_cols,
+        pt.size = 1) +
+  theme(plot.title = element_blank()) +
+  NoAxes() 
+dev.off()
+
+# Hierarchical analysis
+emb <- Embeddings(seu_reliable, reduction = "umap")[, 1:2]
+meta <- seu_reliable@meta.data[, c("nCount_RNA", "seurat_clusters")]
+df <- data.frame(
+  UMAP_1 = emb[,1],
+  UMAP_2 = emb[,2],
+  nCount_RNA = meta$nCount_RNA,
+  seurat_clusters = meta$seurat_clusters
+)
+df$log10_nCount <- log10(df$nCount_RNA)
+
+p3d_reliable <- plot_ly(
+  df,
+  x = ~UMAP_1, y = ~UMAP_2, z = ~log10_nCount,
+  color = ~seurat_clusters, 
+  colors = unname(cluster_cols),          
+  type = "scatter3d", mode = "markers",
+  marker = list(size = 2, opacity = 1)
+) %>% 
+  layout(
+    scene = list(
+      xaxis = list(title = "UMAP 1"),
+      yaxis = list(title = "UMAP 2"),
+      zaxis = list(title = "log10(Total UMI counts)")   
+    ),
+    legend = list(orientation = "h", y = 1.05)
+  )
+
+p3d_reliable     # Choose "zoom"
+saveWidget(
+  p3d_reliable,
+  file = "/Users/<user_name>/Desktop/zero_eim/zero_final/pbmc_reliable_clusters_3d_plot.html",
+  selfcontained = TRUE
+)
+
+# Convert file types
+m_counts <- seu_reliable@assays$RNA$counts
+m_data <- seu_reliable@assays$RNA$data
+sce <- as.SingleCellExperiment(seu_reliable, assay = "RNA")
+SummarizedExperiment::assay(sce, "counts")    <- as(m_counts, "dgCMatrix")
+SummarizedExperiment::assay(sce, "logcounts") <- as(m_data,   "dgCMatrix")
+if ("pca"  %in% Reductions(seu_reliable)) SingleCellExperiment::reducedDim(sce, "X_pca")  <- Embeddings(seu_reliable, "pca")
+if ("umap" %in% Reductions(seu_reliable)) SingleCellExperiment::reducedDim(sce, "X_umap") <- Embeddings(seu_reliable, "umap")
+zellkonverter::writeH5AD(sce, "pbmc.h5ad")
+
+# PAGA analysis by scanpy via reticulate
+adata <- sc$read_h5ad("pbmc.h5ad")
+adata$obs["seurat_clusters"] <- adata$obs["seurat_clusters"]$astype("category")
+Xp <- adata$obsm$get("X_pca")
+if (py_has_attr(Xp, "values")) {         # pandas.DataFrame -> ndarray
+  Xp <- Xp$values
+}
+Xp <- np$ascontiguousarray(np$asarray(Xp, dtype="float32"))
+adata$obsm$`__setitem__`("X_pca", Xp)
+n_pcs_available <- as.integer(py_to_r(adata$obsm$get("X_pca")$shape[[1]]))
+n_pcs_use <- as.integer(min(30L, n_pcs_available))
+
+sc$pp$neighbors(
+  adata,
+  use_rep    = "X_pca",
+  n_neighbors = as.integer(num_neighbors),
+  n_pcs       = n_pcs_use
+)
+
+sc$tl$paga(adata, groups="seurat_clusters")
+sc$pl$paga(adata, threshold=0.25, show=TRUE)
+
+# Embedding PAGA connection
+coo   <- adata$uns[['paga']][['connectivities']]$tocoo()
+rows  <- py_to_r(coo$row)
+cols  <- py_to_r(coo$col)
+w     <- py_to_r(coo$data)
+cats_py <- adata$obs[['seurat_clusters']]$cat$categories$astype('str')
+cats    <- as.character(py_to_r(cats_py$tolist())) 
+
+edges <- data.frame(
+  source = cats[rows + 1],   # Python 0-index -> R 1-index
+  target = cats[cols + 1],
+  weight = w,
+  stringsAsFactors = FALSE
+)
+edges <- edges[edges$source < edges$target, ]
+edges <- subset(edges, weight >= 0.25)
+
+emb <- Embeddings(seu_reliable, "umap") %>% as.data.frame()
+emb$cluster <- as.character(seu_reliable$seurat_clusters)
+centroids <- emb %>%
+  group_by(cluster) %>%
+  summarize(UMAP_1 = mean(umap_1), UMAP_2 = mean(umap_2), .groups = "drop")
+edges_plot <- edges %>%
+  left_join(centroids, by = c("source" = "cluster")) %>%
+  rename(x1 = UMAP_1, y1 = UMAP_2) %>%
+  left_join(centroids, by = c("target" = "cluster")) %>%
+  rename(x2 = UMAP_1, y2 = UMAP_2) 
+
+p <- DimPlot(
+  seu_reliable,
+  reduction = "umap",
+  group.by  = "seurat_clusters",
+  label     = FALSE,
+  pt.size   = 1,
+  cols     = cluster_cols
+) +
+  theme(plot.title = element_blank())
+
+png(filename = "paga_umap_reliable.png", width = 480, height = 320)
+p +
+  geom_segment(
+    data = edges_plot,
+    aes(x = x1, y = y1, xend = x2, yend = y2, alpha = weight),
+    linewidth = 2,
+    inherit.aes = FALSE,
+    color = "black",
+    lineend = "round"
+  ) +
+  scale_size(range = c(0.4, 2.4), guide = "none") +
+  scale_alpha(range = c(0.25, 0.9), guide = "none") +
+  NoAxes() 
+dev.off()
+
+# Imputation or normalization method comparison
+## scTransformation
+seurat_pbmc_filtered_II_sct <- SCTransform(seurat_pbmc_filtered_II,
+                                           variable.features.n = 2000,
+                                           do.scale = TRUE)
+seurat_pbmc_filtered_II_sct <- RunPCA(seurat_pbmc_filtered_II_sct)
+
+png(filename = "pca_II_sct.png", width = 480, height = 320)
+ElbowPlot(seurat_pbmc_filtered_II_sct, reduction = "pca", ndims = 50)
+dev.off()
+
+seurat_pbmc_filtered_II_valid_sct <- SCTransform(seurat_pbmc_filtered_II_valid,
+                                           variable.features.n = 2000,
+                                           do.scale = TRUE)
+seurat_pbmc_filtered_II_valid_sct <- RunPCA(seurat_pbmc_filtered_II_valid_sct)
+
+png(filename = "pca_II_valid_sct.png", width = 480, height = 320)
+ElbowPlot(seurat_pbmc_filtered_II_valid_sct, reduction = "pca", ndims = 50)
+dev.off()
+
+num_neighbors <- floor(seurat_pbmc_filtered_II_sct@assays$RNA@layers$counts@Dim[[2]] / 100)
+seurat_pbmc_filtered_II_sct <- FindNeighbors(seurat_pbmc_filtered_II_sct, dims = 1:30, k.param = num_neighbors)
+seurat_pbmc_filtered_II_sct <- FindClusters(seurat_pbmc_filtered_II_sct, resolution = 1)
+seurat_pbmc_filtered_II_sct <- RunUMAP(seurat_pbmc_filtered_II_sct, dims = 1:30, n.neighbors = num_neighbors)
+
+cl_levels <- levels(seurat_pbmc_filtered_II_sct$seurat_clusters)
+cluster_cols <- Seurat::DiscretePalette(length(cl_levels), palette = "parade")
+names(cluster_cols) <- cl_levels
+
+png(filename = "umap_II_sct.png", width = 480, height = 320)
+DimPlot(seurat_pbmc_filtered_II_sct, 
+        group.by = "seurat_clusters", 
+        label = FALSE,
+        cols     = cluster_cols,
+        pt.size = 1) +
+  theme(plot.title = element_blank()) +
+  NoAxes() 
+dev.off()
+
+# Hierarchical analysis
+emb <- Embeddings(seurat_pbmc_filtered_II_sct, reduction = "umap")[, 1:2]
+meta <- seurat_pbmc_filtered_II_sct@meta.data[, c("nCount_RNA", "seurat_clusters")]
+df <- data.frame(
+  UMAP_1 = emb[,1],
+  UMAP_2 = emb[,2],
+  nCount_RNA = meta$nCount_RNA,
+  seurat_clusters = meta$seurat_clusters
+)
+df$log10_nCount <- log10(df$nCount_RNA)
+
+p3d_II_sct <- plot_ly(
+  df,
+  x = ~UMAP_1, y = ~UMAP_2, z = ~log10_nCount,
+  color = ~seurat_clusters, 
+  colors = unname(cluster_cols),          
+  type = "scatter3d", mode = "markers",
+  marker = list(size = 2, opacity = 1)
+) %>% 
+  layout(
+    scene = list(
+      xaxis = list(title = "UMAP 1"),
+      yaxis = list(title = "UMAP 2"),
+      zaxis = list(title = "log10(Total UMI counts)")   
+    ),
+    legend = list(orientation = "h", y = 1.05)
+  )
+
+p3d_II_sct     # choose "Zoom"
+saveWidget(
+  p3d_II_sct,
+  file = "/Users/<user_name>/Desktop/zero_eim/zero_final/pbmc_Mono_scT_clusters_3d_plot.html",
+  selfcontained = TRUE
+)
+
+num_neighbors <- floor(seurat_pbmc_filtered_II_valid_sct@assays$RNA@layers$counts@Dim[[2]] / 100)
+seurat_pbmc_filtered_II_valid_sct <- FindNeighbors(seurat_pbmc_filtered_II_valid_sct, dims = 1:30, k.param = num_neighbors)
+seurat_pbmc_filtered_II_valid_sct <- FindClusters(seurat_pbmc_filtered_II_valid_sct, resolution = 1)
+seurat_pbmc_filtered_II_valid_sct <- RunUMAP(seurat_pbmc_filtered_II_valid_sct, dims = 1:30, n.neighbors = num_neighbors)
+
+cl_levels <- levels(seurat_pbmc_filtered_II_valid_sct$seurat_clusters)
+cluster_cols <- Seurat::DiscretePalette(length(cl_levels), palette = "parade")
+names(cluster_cols) <- cl_levels
+
+png(filename = "umap_II_valid_sct.png", width = 480, height = 320)
+DimPlot(seurat_pbmc_filtered_II_valid_sct, 
+        group.by = "seurat_clusters", 
+        label = FALSE,
+        cols     = cluster_cols,
+        pt.size = 1) +
+  theme(plot.title = element_blank()) +
+  NoAxes() 
+dev.off()
+
+## ALRA (using "data")
+seurat_pbmc_filtered_II_alra <- RunALRA(
+  object          = seurat_pbmc_filtered_II,
+  assay           = "RNA",
+  slot            = "data",
+  setDefaultAssay = TRUE 
+)
+
+seurat_pbmc_filtered_II_valid_alra <- RunALRA(
+  object          = seurat_pbmc_filtered_II_valid,
+  assay           = "RNA",
+  slot            = "data",
+  setDefaultAssay = TRUE 
+)
+
+num_neighbors <- floor(seurat_pbmc_filtered_II_alra@assays$RNA@layers$counts@Dim[[2]] / 100)
+seurat_pbmc_filtered_II_alra <- FindVariableFeatures(seurat_pbmc_filtered_II_alra, selection.method = "vst", nfeatures = 2000)
+seurat_pbmc_filtered_II_alra <- ScaleData(seurat_pbmc_filtered_II_alra)
+seurat_pbmc_filtered_II_alra <- RunPCA(seurat_pbmc_filtered_II_alra)
+
+png(filename = "pca_II_alra.png", width = 480, height = 320)
+ElbowPlot(seurat_pbmc_filtered_II_alra, reduction = "pca", ndims = 50)
+dev.off()
+
+seurat_pbmc_filtered_II_alra <- FindNeighbors(seurat_pbmc_filtered_II_alra, dims = 1:30, k.param = num_neighbors)
+seurat_pbmc_filtered_II_alra <- FindClusters(seurat_pbmc_filtered_II_alra, resolution = 1)
+seurat_pbmc_filtered_II_alra <- RunUMAP(seurat_pbmc_filtered_II_alra, dims = 1:30, n.neighbors = num_neighbors)
+
+cl_levels <- levels(seurat_pbmc_filtered_II_alra$seurat_clusters)
+cluster_cols <- Seurat::DiscretePalette(length(cl_levels), palette = "parade")
+names(cluster_cols) <- cl_levels
+
+png(filename = "umap_II_alra.png", width = 480, height = 320)
+DimPlot(seurat_pbmc_filtered_II_alra, 
+        group.by = "seurat_clusters", 
+        label = FALSE,
+        cols     = cluster_cols,
+        pt.size = 1) +
+  theme(plot.title = element_blank()) +
+  NoAxes() 
+dev.off()
+
+# Hierarchical analysis
+emb <- Embeddings(seurat_pbmc_filtered_II_alra, reduction = "umap")[, 1:2]
+meta <- seurat_pbmc_filtered_II_alra@meta.data[, c("nCount_RNA", "seurat_clusters")]
+df <- data.frame(
+  UMAP_1 = emb[,1],
+  UMAP_2 = emb[,2],
+  nCount_RNA = meta$nCount_RNA,
+  seurat_clusters = meta$seurat_clusters
+)
+df$log10_nCount <- log10(df$nCount_RNA)
+
+p3d_II_alra <- plot_ly(
+  df,
+  x = ~UMAP_1, y = ~UMAP_2, z = ~log10_nCount,
+  color = ~seurat_clusters, 
+  colors = unname(cluster_cols),          
+  type = "scatter3d", mode = "markers",
+  marker = list(size = 2, opacity = 1)
+) %>% 
+  layout(
+    scene = list(
+      xaxis = list(title = "UMAP 1"),
+      yaxis = list(title = "UMAP 2"),
+      zaxis = list(title = "log10(Total UMI counts)")   
+    ),
+    legend = list(orientation = "h", y = 1.05)
+  )
+
+p3d_II_alra     # choose "Zoom"
+saveWidget(
+  p3d_II_alra,
+  file = "/Users/<user_name>/Desktop/zero_eim/zero_final/pbmc_Mono_ALRA_clusters_3d_plot.html",
+  selfcontained = TRUE
+)
+
+num_neighbors <- floor(seurat_pbmc_filtered_II_valid_alra@assays$RNA@layers$counts@Dim[[2]] / 100)
+seurat_pbmc_filtered_II_valid_alra <- FindVariableFeatures(seurat_pbmc_filtered_II_valid_alra, selection.method = "vst", nfeatures = 2000)
+seurat_pbmc_filtered_II_valid_alra <- ScaleData(seurat_pbmc_filtered_II_valid_alra)
+seurat_pbmc_filtered_II_valid_alra <- RunPCA(seurat_pbmc_filtered_II_valid_alra)
+
+png(filename = "pca_II_valid_alra.png", width = 480, height = 320)
+ElbowPlot(seurat_pbmc_filtered_II_valid_alra, reduction = "pca", ndims = 50)
+dev.off()
+
+seurat_pbmc_filtered_II_valid_alra <- FindNeighbors(seurat_pbmc_filtered_II_valid_alra, dims = 1:30, k.param = num_neighbors)
+seurat_pbmc_filtered_II_valid_alra <- FindClusters(seurat_pbmc_filtered_II_valid_alra, resolution = 1)
+seurat_pbmc_filtered_II_valid_alra <- RunUMAP(seurat_pbmc_filtered_II_valid_alra, dims = 1:30, n.neighbors = num_neighbors)
+
+cl_levels <- levels(seurat_pbmc_filtered_II_valid_alra$seurat_clusters)
+cluster_cols <- Seurat::DiscretePalette(length(cl_levels), palette = "parade")
+names(cluster_cols) <- cl_levels
+
+png(filename = "umap_II_valid_alra.png", width = 480, height = 320)
+DimPlot(seurat_pbmc_filtered_II_valid_alra, 
+        group.by = "seurat_clusters", 
+        label = FALSE,
+        cols     = cluster_cols,
+        pt.size = 1) +
+  theme(plot.title = element_blank()) +
+  NoAxes() 
+dev.off()
+
+## SAVER (using "counts")
+## Reload R again
+library(SAVER)
+
+library(hdf5r)
+library(Seurat)
+library(tidyverse)
+library(plotly)
+library(SeuratDisk)
+library(SeuratWrappers)
+library(reticulate)
+library(zellkonverter)
+library(scales)
+library(htmlwidgets)
+
+# Fix seed again
+set.seed(42)
+
+cnt1 <- GetAssayData(seurat_pbmc_filtered_II, assay = "RNA", slot = "counts")
+fit1 <- SAVER::saver(cnt1, ncores = 8)
+est1 <- fit1$estimate
+rownames(est1) <- rownames(cnt1); colnames(est1) <- colnames(cnt1)
+lib <- colSums(est1)
+imp1 <- log1p(1e4 * sweep(est1, 2, lib, "/"))
+imp1 <- Matrix::Matrix(imp1, sparse = TRUE)   # Replicate Seurat normalization
+
+cnt2 <- GetAssayData(seurat_pbmc_filtered_II_valid, assay = "RNA", slot = "counts")
+fit2 <- SAVER::saver(cnt2, ncores = 8)
+est2 <- fit2$estimate
+rownames(est2) <- rownames(cnt2); colnames(est2) <- colnames(cnt2)
+lib <- colSums(est2)
+imp2 <- log1p(1e4 * sweep(est2, 2, lib, "/"))
+imp2 <- Matrix::Matrix(imp2, sparse = TRUE)   # Replicate Seurat normalization
+
+seurat_pbmc_filtered_II_saver <- seurat_pbmc_filtered_II
+seurat_pbmc_filtered_II_saver@assays$saver <- CreateAssayObject(data = imp1)
+DefaultAssay(seurat_pbmc_filtered_II_saver) <- "saver"
+
+num_neighbors <- floor(seurat_pbmc_filtered_II_saver@assays$RNA@layers$counts@Dim[[2]] / 100)
+seurat_pbmc_filtered_II_saver <- FindVariableFeatures(seurat_pbmc_filtered_II_saver, selection.method = "vst", nfeatures = 2000)
+seurat_pbmc_filtered_II_saver <- ScaleData(seurat_pbmc_filtered_II_saver)
+seurat_pbmc_filtered_II_saver <- RunPCA(seurat_pbmc_filtered_II_saver)
+
+png(filename = "pca_II_saver.png", width = 480, height = 320)
+ElbowPlot(seurat_pbmc_filtered_II_saver, reduction = "pca", ndims = 50)
+dev.off()
+
+seurat_pbmc_filtered_II_saver <- FindNeighbors(seurat_pbmc_filtered_II_saver, dims = 1:30, k.param = num_neighbors)
+seurat_pbmc_filtered_II_saver <- FindClusters(seurat_pbmc_filtered_II_saver, resolution = 1)
+seurat_pbmc_filtered_II_saver <- RunUMAP(seurat_pbmc_filtered_II_saver, dims = 1:30, n.neighbors = num_neighbors)
+
+cl_levels <- levels(seurat_pbmc_filtered_II_saver$seurat_clusters)
+cluster_cols <- Seurat::DiscretePalette(length(cl_levels), palette = "parade")
+names(cluster_cols) <- cl_levels
+
+png(filename = "umap_II_saver.png", width = 480, height = 320)
+DimPlot(seurat_pbmc_filtered_II_saver, 
+        group.by = "seurat_clusters", 
+        label = FALSE,
+        cols     = cluster_cols,
+        pt.size = 1) +
+  theme(plot.title = element_blank()) +
+  NoAxes() 
+dev.off()
+
+# Hierarchical analysis
+emb <- Embeddings(seurat_pbmc_filtered_II_saver, reduction = "umap")[, 1:2]
+meta <- seurat_pbmc_filtered_II_saver@meta.data[, c("nCount_RNA", "seurat_clusters")]
+df <- data.frame(
+  UMAP_1 = emb[,1],
+  UMAP_2 = emb[,2],
+  nCount_RNA = meta$nCount_RNA,
+  seurat_clusters = meta$seurat_clusters
+)
+df$log10_nCount <- log10(df$nCount_RNA)
+
+p3d_II_saver <- plot_ly(
+  df,
+  x = ~UMAP_1, y = ~UMAP_2, z = ~log10_nCount,
+  color = ~seurat_clusters, 
+  colors = unname(cluster_cols),          
+  type = "scatter3d", mode = "markers",
+  marker = list(size = 2, opacity = 1)
+) %>% 
+  layout(
+    scene = list(
+      xaxis = list(title = "UMAP 1"),
+      yaxis = list(title = "UMAP 2"),
+      zaxis = list(title = "log10(Total UMI counts)")   
+    ),
+    legend = list(orientation = "h", y = 1.05)
+  )
+
+p3d_II_saver     # choose "Zoom"
+saveWidget(
+  p3d_II_saver,
+  file = "/Users/<user_name>/Desktop/zero_eim/zero_final/pbmc_Mono_SAVER_clusters_3d_plot.html",
+  selfcontained = TRUE
+)
+
+seurat_pbmc_filtered_II_valid_saver <- seurat_pbmc_filtered_II_valid
+seurat_pbmc_filtered_II_valid_saver@assays$saver <- CreateAssayObject(data = imp2)
+DefaultAssay(seurat_pbmc_filtered_II_valid_saver) <- "saver"
+
+num_neighbors <- floor(seurat_pbmc_filtered_II_valid_saver@assays$RNA@layers$counts@Dim[[2]] / 100)
+seurat_pbmc_filtered_II_valid_saver <- FindVariableFeatures(seurat_pbmc_filtered_II_valid_saver, selection.method = "vst", nfeatures = 2000)
+seurat_pbmc_filtered_II_valid_saver <- ScaleData(seurat_pbmc_filtered_II_valid_saver)
+seurat_pbmc_filtered_II_valid_saver <- RunPCA(seurat_pbmc_filtered_II_valid_saver)
+
+png(filename = "pca_II_valid_saver.png", width = 480, height = 320)
+ElbowPlot(seurat_pbmc_filtered_II_valid_saver, reduction = "pca", ndims = 50)
+dev.off()
+
+seurat_pbmc_filtered_II_valid_saver <- FindNeighbors(seurat_pbmc_filtered_II_valid_saver, dims = 1:30, k.param = num_neighbors)
+seurat_pbmc_filtered_II_valid_saver <- FindClusters(seurat_pbmc_filtered_II_valid_saver, resolution = 1)
+seurat_pbmc_filtered_II_valid_saver <- RunUMAP(seurat_pbmc_filtered_II_valid_saver, dims = 1:30, n.neighbors = num_neighbors)
+
+cl_levels <- levels(seurat_pbmc_filtered_II_valid_saver$seurat_clusters)
+cluster_cols <- Seurat::DiscretePalette(length(cl_levels), palette = "parade")
+names(cluster_cols) <- cl_levels
+
+png(filename = "umap_II_valid_saver.png", width = 480, height = 320)
+DimPlot(seurat_pbmc_filtered_II_valid_saver, 
+        group.by = "seurat_clusters", 
+        label = FALSE,
+        cols     = cluster_cols,
+        pt.size = 1) +
+  theme(plot.title = element_blank()) +
+  NoAxes() 
+dev.off()
+
+## scImpute (using "counts")
+## Reload R again
+library(scImpute)
+
+library(hdf5r)
+library(Seurat)
+library(tidyverse)
+library(plotly)
+library(SeuratDisk)
+library(SeuratWrappers)
+library(reticulate)
+library(zellkonverter)
+library(scales)
+library(htmlwidgets)
+
+# Fix seed again
+set.seed(42)
+
+num_clusters_scimpute <- 7 # the number of seurat_clusters generated in seurat_pbmc_filtered_II_valid
+
+cnt1 <- GetAssayData(seurat_pbmc_filtered_II, assay = "RNA", slot = "counts")
+num_neighbors <- floor(seurat_pbmc_filtered_II@assays$RNA@layers$counts@Dim[[2]] / 100)
+td1  <- tempfile("scimpute1_"); dir.create(td1)
+in1  <- file.path(td1, "counts.rds")
+out1 <- file.path(td1, "out"); dir.create(out1)
+saveRDS(as.matrix(cnt1), in1)
+scimpute(count_path = in1, infile = "rds", outfile = "rds", out_dir = out1, Kcluster = num_clusters_scimpute, ncores = 8)
+imp_counts1 <- readRDS(file.path(td1, "outscimpute_count.rds"))
+rownames(imp_counts1) <- rownames(cnt1); colnames(imp_counts1) <- colnames(cnt1)
+lib1 <- colSums(imp_counts1)
+imp1 <- log1p(1e4 * sweep(imp_counts1, 2, lib1, "/"))
+imp1 <- Matrix::Matrix(imp1, sparse = TRUE)
+
+seurat_pbmc_filtered_II_scimpute <- seurat_pbmc_filtered_II
+seurat_pbmc_filtered_II_scimpute@assays$scimpute <- CreateAssayObject(data = imp1)
+DefaultAssay(seurat_pbmc_filtered_II_scimpute) <- "scimpute"
+
+seurat_pbmc_filtered_II_scimpute <- FindVariableFeatures(seurat_pbmc_filtered_II_scimpute, selection.method = "vst", nfeatures = 2000)
+seurat_pbmc_filtered_II_scimpute <- ScaleData(seurat_pbmc_filtered_II_scimpute)
+seurat_pbmc_filtered_II_scimpute <- RunPCA(seurat_pbmc_filtered_II_scimpute)
+
+png(filename = "pca_II_scimpute.png", width = 480, height = 320)
+ElbowPlot(seurat_pbmc_filtered_II_scimpute, reduction = "pca", ndims = 50)
+dev.off()
+
+seurat_pbmc_filtered_II_scimpute <- FindNeighbors(seurat_pbmc_filtered_II_scimpute, dims = 1:30, k.param = num_neighbors)
+seurat_pbmc_filtered_II_scimpute <- FindClusters(seurat_pbmc_filtered_II_scimpute, resolution = 1)
+seurat_pbmc_filtered_II_scimpute <- RunUMAP(seurat_pbmc_filtered_II_scimpute, dims = 1:30, n.neighbors = num_neighbors)
+
+cl_levels <- levels(seurat_pbmc_filtered_II_scimpute$seurat_clusters)
+cluster_cols <- Seurat::DiscretePalette(length(cl_levels), palette = "parade")
+names(cluster_cols) <- cl_levels
+
+png(filename = "umap_II_scimpute.png", width = 480, height = 320)
+DimPlot(seurat_pbmc_filtered_II_scimpute, 
+        group.by = "seurat_clusters", 
+        label = FALSE,
+        cols     = cluster_cols,
+        pt.size = 1) +
+  theme(plot.title = element_blank()) +
+  NoAxes() 
+dev.off()
+
+# Hierarchical analysis
+emb <- Embeddings(seurat_pbmc_filtered_II_scimpute, reduction = "umap")[, 1:2]
+meta <- seurat_pbmc_filtered_II_scimpute@meta.data[, c("nCount_RNA", "seurat_clusters")]
+df <- data.frame(
+  UMAP_1 = emb[,1],
+  UMAP_2 = emb[,2],
+  nCount_RNA = meta$nCount_RNA,
+  seurat_clusters = meta$seurat_clusters
+)
+df$log10_nCount <- log10(df$nCount_RNA)
+
+p3d_II_scimpute <- plot_ly(
+  df,
+  x = ~UMAP_1, y = ~UMAP_2, z = ~log10_nCount,
+  color = ~seurat_clusters, 
+  colors = unname(cluster_cols),          
+  type = "scatter3d", mode = "markers",
+  marker = list(size = 2, opacity = 1)
+) %>% 
+  layout(
+    scene = list(
+      xaxis = list(title = "UMAP 1"),
+      yaxis = list(title = "UMAP 2"),
+      zaxis = list(title = "log10(Total UMI counts)")   
+    ),
+    legend = list(orientation = "h", y = 1.05)
+  )
+
+p3d_II_scimpute     # choose "Zoom"
+saveWidget(
+  p3d_II_scimpute,
+  file = "/Users/<user_name>/Desktop/zero_eim/zero_final/pbmc_Mono_scImpute_clusters_3d_plot.html",
+  selfcontained = TRUE
+)
+
+cnt2 <- GetAssayData(seurat_pbmc_filtered_II_valid, assay = "RNA", slot = "counts")
+num_neighbors <- floor(seurat_pbmc_filtered_II_valid@assays$RNA@layers$counts@Dim[[2]] / 100)
+td2  <- tempfile("scimpute2_"); dir.create(td2)
+in2  <- file.path(td2, "counts.rds")
+out2 <- file.path(td2, "out"); dir.create(out2)
+saveRDS(as.matrix(cnt2), in2)
+scimpute(count_path = in2, infile = "rds", outfile = "rds", out_dir = out2, Kcluster = num_clusters_scimpute, ncores = 8)
+imp_counts2 <- readRDS(file.path(td2, "outscimpute_count.rds"))
+rownames(imp_counts2) <- rownames(cnt2); colnames(imp_counts2) <- colnames(cnt2)
+lib2 <- colSums(imp_counts2)
+imp2 <- log1p(1e4 * sweep(imp_counts2, 2, lib2, "/"))
+imp2 <- Matrix::Matrix(imp2, sparse = TRUE)
+
+seurat_pbmc_filtered_II_valid_scimpute <- seurat_pbmc_filtered_II_valid
+seurat_pbmc_filtered_II_valid_scimpute@assays$scimpute <- CreateAssayObject(data = imp2)
+DefaultAssay(seurat_pbmc_filtered_II_valid_scimpute) <- "scimpute"
+
+seurat_pbmc_filtered_II_valid_scimpute <- FindVariableFeatures(seurat_pbmc_filtered_II_valid_scimpute, selection.method = "vst", nfeatures = 2000)
+seurat_pbmc_filtered_II_valid_scimpute <- ScaleData(seurat_pbmc_filtered_II_valid_scimpute)
+seurat_pbmc_filtered_II_valid_scimpute <- RunPCA(seurat_pbmc_filtered_II_valid_scimpute)
+
+png(filename = "pca_II_valid_scimpute.png", width = 480, height = 320)
+ElbowPlot(seurat_pbmc_filtered_II_valid_scimpute, reduction = "pca", ndims = 50)
+dev.off()
+
+seurat_pbmc_filtered_II_valid_scimpute <- FindNeighbors(seurat_pbmc_filtered_II_valid_scimpute, dims = 1:30, k.param = num_neighbors)
+seurat_pbmc_filtered_II_valid_scimpute <- FindClusters(seurat_pbmc_filtered_II_valid_scimpute, resolution = 1)
+seurat_pbmc_filtered_II_valid_scimpute <- RunUMAP(seurat_pbmc_filtered_II_valid_scimpute, dims = 1:30, n.neighbors = num_neighbors)
+
+cl_levels <- levels(seurat_pbmc_filtered_II_valid_scimpute$seurat_clusters)
+cluster_cols <- Seurat::DiscretePalette(length(cl_levels), palette = "parade")
+names(cluster_cols) <- cl_levels
+
+png(filename = "umap_II_valid_scimpute.png", width = 480, height = 320)
+DimPlot(seurat_pbmc_filtered_II_valid_scimpute, 
+        group.by = "seurat_clusters", 
+        label = FALSE,
+        cols     = cluster_cols,
+        pt.size = 1) +
+  theme(plot.title = element_blank()) +
+  NoAxes() 
+dev.off()
