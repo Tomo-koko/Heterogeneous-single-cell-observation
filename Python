@@ -1,0 +1,602 @@
+# Setting
+import numpy as np
+import pandas as pd
+import random
+from tqdm import trange
+
+import math
+import matplotlib.pyplot as plt
+from math import factorial
+from math import lgamma
+
+import os
+import h5py
+from scipy.sparse import csc_matrix
+
+# Reproducibility
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+
+# Fixed parameters
+gene_count = 36601
+sample_count_pbmc = 5500
+max_k_pbmc = 40
+max_k = 70
+mean_sampling = 5000
+std_sampling = 1500
+
+# Linear Model
+expression_levels = np.floor((np.maximum(0, np.arange(1, gene_count + 1) - 26301)) / 300).astype(int)
+expanded_vector = np.repeat(np.arange(1, gene_count + 1), expression_levels)
+gene_count_vector = np.bincount(expanded_vector, minlength=gene_count + 1)[1:]
+gene_frequency_vector = gene_count_vector / len(expanded_vector)
+print("Total length:", len(expanded_vector))
+
+plt.figure(figsize=(5, 3.5))
+plt.plot(np.arange(1, gene_count + 1), gene_frequency_vector)
+plt.xlabel("Gene ID (i)")
+plt.ylabel("UMI Occurrence Frequency")
+plt.title("")
+plt.grid(True)
+plt.tight_layout()
+plt.savefig("/Users/<user_name>/Desktop/zero_eim/gene_frequency_plot_linear_pi.png", dpi=300)
+plt.close()
+
+# E[N(k)] Plotting under Poisson Distribution
+E_Nk = []
+p = gene_frequency_vector  # shape: (n_genes,)
+lam = sample_count_pbmc * p  # Poisson λ_i for each gene
+
+for k in range(max_k_pbmc + 1):
+    # Poisson pmf for each gene i
+    prob_k = np.exp(-lam) * (lam ** k) / factorial(k)
+    # sum over genes → expected number of genes with exactly k counts
+    expected_k = np.sum(prob_k)
+    E_Nk.append(expected_k)
+
+plt.figure(figsize=(5, 3.5))
+plt.plot(range(max_k_pbmc + 1), E_Nk, marker='o', markersize = 3, linewidth = 1)
+plt.xlabel("k (Number of UMIs per gene)")
+plt.ylabel("Expected Number of Genes with k UMIs")
+plt.title("")
+plt.yscale("log") 
+plt.ylim(bottom=0.5, top=50000)  
+plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+plt.tight_layout()
+plt.savefig("/Users/<user_name>/Desktop/zero_eim/E_Nk_plot_linear_pbmc_poisson.png", dpi=300)
+plt.close()
+
+# E[N(k)] Plotting under Negative Binomial Distribution
+thetas = [0.01, 0.1, 0.3, 0.5, 1, 10]
+mu = sample_count_pbmc * p  # Poisson λ_i for each gene
+
+E_nb_dict = {}
+for r in thetas:
+    E_Nk = []
+    
+    for k in range(max_k_pbmc + 1):
+        nb_coeff = np.exp(math.lgamma(k + r) - math.lgamma(r) - math.lgamma(k + 1))
+        prob_k = nb_coeff * ((r / (r + mu)) ** r) * ((mu / (r + mu)) ** k)
+        expected_k = np.sum(prob_k)
+        E_Nk.append(expected_k)
+    
+    E_nb_dict[r] = E_Nk
+
+plt.figure(figsize=(5, 3.5))
+
+for r in thetas:
+    plt.plot(E_nb_dict[r], marker='o', markersize = 3, linewidth = 1, label=f'NB θ={r}')
+
+plt.xlabel("k (Number of UMIs per gene)")
+plt.ylabel("Expected Number of Genes with k UMIs")
+plt.title("")
+plt.yscale("log") 
+plt.ylim(bottom=0.5, top=50000)  
+plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+plt.legend(title=r'Negative Binomial $\theta$', loc='best', frameon=True)
+plt.tight_layout()
+plt.savefig("/Users/<user_name>/Desktop/zero_eim/E_Nk_plot_linear_pbmc_NB.png", dpi=300)
+plt.close()
+
+# Generate Exponential Expression Model
+expression_levels = np.floor(np.exp((np.arange(1, gene_count + 1) - 36000) / 75)).astype(int)
+expanded_vector = np.repeat(np.arange(1, gene_count + 1), expression_levels)
+gene_count_vector = np.bincount(expanded_vector, minlength=gene_count + 1)[1:]
+gene_frequency_vector = gene_count_vector / len(expanded_vector)
+print("Total length:", len(expanded_vector))
+
+plt.figure(figsize=(5, 3.5))
+plt.plot(np.arange(1, gene_count + 1), gene_frequency_vector)
+plt.xlabel("Gene ID (i)")
+plt.ylabel("UMI Occurrence Frequency")
+plt.title("")
+plt.grid(True)
+plt.tight_layout()
+plt.savefig("/Users/<user_name>/Desktop/zero_eim/gene_frequency_plot_exp_pi.png", dpi=300)
+plt.close()
+
+# E[N(k)] Plotting under Poisson Distribution (theta -> Inf)
+E_Nk = []
+p = gene_frequency_vector  # shape: (n_genes,)
+lam = sample_count_pbmc * p  # Poisson λ_i for each gene
+
+for k in range(max_k_pbmc + 1):
+    prob_k = np.exp(-lam) * (lam ** k) / factorial(k)
+    expected_k = np.sum(prob_k)
+    E_Nk.append(expected_k)
+
+plt.figure(figsize=(5, 3.5))
+plt.plot(range(max_k_pbmc + 1), E_Nk, marker='o', markersize = 3, linewidth = 1)
+plt.xlabel("k (Number of UMIs per gene)")
+plt.ylabel("Expected Number of Genes with k UMIs")
+plt.title("")
+plt.yscale("log") 
+plt.ylim(bottom=0.5, top=50000)  
+plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+plt.tight_layout()
+plt.savefig("/Users/<user_name>/Desktop/zero_eim/E_Nk_plot_exp_pbmc_poisson.png", dpi=300)
+plt.close()
+
+# E[N(k)] Plotting under Negative Binomial Distribution
+thetas = [0.01, 0.1, 0.3, 0.5, 1, 10]
+mu = sample_count_pbmc * p  # Poisson λ_i for each gene
+
+E_nb_dict = {}
+for r in thetas:
+    E_Nk = []
+    
+    for k in range(max_k_pbmc + 1):
+        nb_coeff = np.exp(math.lgamma(k + r) - math.lgamma(r) - math.lgamma(k + 1))
+        prob_k = nb_coeff * ((r / (r + mu)) ** r) * ((mu / (r + mu)) ** k)
+        expected_k = np.sum(prob_k)
+        E_Nk.append(expected_k)
+    
+    E_nb_dict[r] = E_Nk
+
+plt.figure(figsize=(5, 3.5))
+
+for r in thetas:
+    plt.plot(E_nb_dict[r], marker='o', markersize = 3, linewidth = 1, label=f'θ={r}')
+
+plt.xlabel("k (Number of UMIs per gene)")
+plt.ylabel("Expected Number of Genes with k UMIs")
+plt.title("")
+plt.yscale("log") 
+plt.ylim(bottom=0.5, top=50000)  
+plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+plt.legend(title=r'Negative Binomial $\theta$', loc='best', frameon=True)
+plt.tight_layout()
+plt.savefig("/Users/<user_name>/Desktop/zero_eim/E_Nk_plot_exp_pbmc_NB.png", dpi=300)
+plt.close()
+
+# Generate Combinational Expression Model
+expression_levels = (np.floor(np.exp((np.arange(1, gene_count + 1) - 36000) / 75)) + np.floor((np.maximum(0, np.arange(1, gene_count + 1) - 26301)) / 300)).astype(int)
+expanded_vector = np.repeat(np.arange(1, gene_count + 1), expression_levels)
+gene_count_vector = np.bincount(expanded_vector, minlength=gene_count + 1)[1:]
+gene_frequency_vector = gene_count_vector / len(expanded_vector)
+print("Total length:", len(expanded_vector))
+
+plt.figure(figsize=(5, 3.5))
+plt.plot(np.arange(1, gene_count + 1), gene_frequency_vector)
+plt.xlabel("Gene ID (i)")
+plt.ylabel("UMI Occurrence Frequency")
+plt.title("")
+plt.grid(True)
+plt.tight_layout()
+plt.savefig("/Users/<user_name>/Desktop/zero_eim/gene_frequency_plot_combo_pi.png", dpi=300)
+plt.close()
+
+# E[N(k)] Plotting under Poisson Distribution (theta -> Inf)
+E_Nk = []
+p = gene_frequency_vector  # shape: (n_genes,)
+lam = sample_count_pbmc * p  # Poisson λ_i for each gene
+
+for k in range(max_k_pbmc + 1):
+    prob_k = np.exp(-lam) * (lam ** k) / factorial(k)
+    expected_k = np.sum(prob_k)
+    E_Nk.append(expected_k)
+
+plt.figure(figsize=(5, 3.5))
+plt.plot(range(max_k_pbmc + 1), E_Nk, marker='o', markersize = 3, linewidth = 1)
+plt.xlabel("k (Number of UMIs per gene)")
+plt.ylabel("Expected Number of Genes with k UMIs")
+plt.title("")
+plt.yscale("log") 
+plt.ylim(bottom=0.5, top=50000)  
+plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+plt.tight_layout()
+plt.savefig("/Users/<user_name>/Desktop/zero_eim/E_Nk_plot_combo_pbmc_poisson.png", dpi=300)
+plt.close()
+
+# E[N(k)] Plotting under Negative Binomial Distribution
+thetas = [0.1, 0.2, 0.3, 0.5, 1, 3, 10]
+mu = sample_count_pbmc * p 
+
+E_nb_dict = {}
+for r in thetas:
+    E_Nk = []
+    
+    for k in range(max_k_pbmc + 1):
+        nb_coeff = np.exp(math.lgamma(k + r) - math.lgamma(r) - math.lgamma(k + 1))
+        prob_k = nb_coeff * ((r / (r + mu)) ** r) * ((mu / (r + mu)) ** k)
+        expected_k = np.sum(prob_k)
+        E_Nk.append(expected_k)
+    
+    E_nb_dict[r] = E_Nk
+
+plt.figure(figsize=(5, 3.5))
+
+for r in thetas:
+    plt.plot(E_nb_dict[r], marker='o', markersize = 3, linewidth = 1, label=f'NB θ={r}')
+
+plt.xlabel("k (Number of UMIs per gene)")
+plt.ylabel("Expected Number of Genes with k UMIs")
+plt.title("")
+plt.yscale("log") 
+plt.ylim(bottom=0.5, top=50000)  
+plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+plt.legend(title=r'Negative Binomial $\theta$', loc='best', frameon=True)
+plt.tight_layout()
+plt.savefig("/Users/<user_name>/Desktop/zero_eim/E_Nk_plot_combo_pbmc_NB.png", dpi=300)
+plt.close()
+
+# Regenerate Combinational Expression Model in the same manner
+expression_levels = (np.floor(np.exp((np.arange(1, gene_count + 1) - 36000) / 75)) + np.floor((np.maximum(0, np.arange(1, gene_count + 1) - 26301)) / 300)).astype(int)
+expanded_vector = np.repeat(np.arange(1, gene_count + 1), expression_levels)
+gene_count_vector = np.bincount(expanded_vector, minlength=gene_count + 1)[1:]
+gene_frequency_vector = gene_count_vector / len(expanded_vector)
+
+# Generate E[N(k)] data at each total UMI count
+depth_values = np.arange(1500, 11501, 1000, dtype=int)
+rows = []
+
+for depth in depth_values:
+    lam = depth * gene_frequency_vector  # λ_i = depth * p_i
+
+    for k in range(max_k + 1):
+        prob_k = np.exp(-lam) * (lam ** k) / factorial(k)
+        expected_k = prob_k.sum()
+        rows.append({
+            "depth": int(depth),             # total UMI count (sampling depth)
+            "k": int(k),                     # UMI count per gene
+            "expected_genes": float(expected_k)  # E[N(k)]
+        })
+
+df = pd.DataFrame(rows)
+
+output_path = "/Users/<user_name>/Desktop/zero_eim/E_Nk_combo_poisson_depth_grid.csv"
+df.to_csv(output_path, index=False)
+print(f"Saved: {output_path}")
+
+# Regenerate Combinational Expression Model in the same manner
+expression_levels = (np.floor(np.exp((np.arange(1, gene_count + 1) - 36000) / 75)) + np.floor((np.maximum(0, np.arange(1, gene_count + 1) - 26301)) / 300)).astype(int)
+expanded_vector = np.repeat(np.arange(1, gene_count + 1), expression_levels)
+gene_count_vector = np.bincount(expanded_vector, minlength=gene_count + 1)[1:]
+gene_frequency_vector = gene_count_vector / len(expanded_vector)
+
+# Generate E[N(k)] data at each total UMI count
+depth_values = np.arange(1500, 11501, 1000, dtype=int)
+theta = 0.5
+rows = []
+
+for depth in depth_values:
+    mu = depth * gene_frequency_vector  # λ_i = depth * p_i
+
+    for k in range(max_k + 1):
+        nb_coeff = np.exp(math.lgamma(k + theta) - math.lgamma(theta) - math.lgamma(k + 1))
+        prob_k = nb_coeff * ((theta / (theta + mu)) ** theta) * ((mu / (theta + mu)) ** k)
+        expected_k = prob_k.sum()
+        rows.append({
+            "depth": int(depth),             # total UMI count (sampling depth)
+            "k": int(k),                     # UMI count per gene
+            "expected_genes": float(expected_k)  # E[N(k)]
+        })
+
+df = pd.DataFrame(rows)
+
+output_path = "/Users/<user_name>/Desktop/zero_eim/E_Nk_combo_nb_depth_grid.csv"
+df.to_csv(output_path, index=False)
+print(f"Saved: {output_path}")
+
+# Data generation for computational simulation
+expression_levels = (np.floor(np.exp((np.arange(1, gene_count + 1) - 36000) / 75)) + np.floor((np.maximum(0, np.arange(1, gene_count + 1) - 26301)) / 300)).astype(int)
+expanded_vector = np.repeat(np.arange(1, gene_count + 1), expression_levels)
+gene_count_vector = np.bincount(expanded_vector, minlength=gene_count + 1)[1:]
+gene_frequency_vector = gene_count_vector / len(expanded_vector)
+
+n_trials = 2000
+n_trials_dummy_1 = 2000
+C_matrix = np.zeros((n_trials + n_trials_dummy_1, gene_count), dtype=int)
+
+for n in trange(n_trials):
+    np.random.seed(SEED + n)
+    k = int(np.maximum(500, np.random.normal(loc=mean_sampling, scale=std_sampling)))
+    sampled = np.random.choice(expanded_vector, size = k, replace=True)
+    counts = np.bincount(sampled, minlength=gene_count + 1)[1:]  # skip index 0
+    C_matrix[n, :] = counts
+
+np.random.seed(SEED)
+
+# dummy cells 1
+low_id  = 26602
+high_id = 36601
+n_pick  = 300
+candidate_idx = np.arange(low_id - 1, high_id)
+picked_idx = np.random.choice(candidate_idx, size=n_pick, replace=False)
+factors = np.random.choice([2, 0.5], size=n_pick)
+unshuffled = expression_levels[picked_idx]
+scaled_values = np.floor(expression_levels[picked_idx] * factors).astype(int)
+expression_levels[picked_idx] = scaled_values
+expanded_vector_dummy_1 = np.repeat(np.arange(1, gene_count + 1), expression_levels)
+
+for n in trange(n_trials_dummy_1):
+    np.random.seed(SEED + n)
+    k = int(np.maximum(500, np.random.normal(loc=mean_sampling, scale=std_sampling)))
+    sampled = np.random.choice(expanded_vector_dummy_1, size = k, replace=True)
+    counts = np.bincount(sampled, minlength=gene_count + 1)[1:]  # skip index 0
+    C_matrix[n + n_trials, :] = counts
+
+# Reset shuffle
+expression_levels[picked_idx] = unshuffled
+np.random.seed(SEED)
+
+# Create pseudo-object
+out_path = os.path.expanduser("~/Desktop/zero_eim/filtered_feature_bc_matrix_trivial_change.h5")
+X = csc_matrix(C_matrix.T)  # (genes, cells)
+n_genes, n_cells = X.shape
+gene_ids   = np.array([f"gene_{i:06d}" for i in range(1, n_genes+1)], dtype=object)
+gene_names = np.array([f"GENE_{i:06d}" for i in range(1, n_genes+1)], dtype=object)
+feature_type = np.array(["Gene Expression"] * n_genes, dtype=object)
+genome = np.array(["na"] * n_genes, dtype=object)
+barcodes_real = [f"cell_{i:06d}_REAL" for i in range(1, n_trials + 1)]
+barcodes_d1   = [f"cell_{i:06d}_D1"   for i in range(1, n_trials_dummy_1 + 1)]
+barcodes  = np.array(barcodes_real + barcodes_d1, dtype=object)
+string_dt = h5py.string_dtype(encoding="utf-8")
+
+with h5py.File(out_path, "w") as f:
+    m = f.create_group("matrix")
+    m.create_dataset("data",    data=X.data,    compression="gzip")
+    m.create_dataset("indices", data=X.indices, compression="gzip")
+    m.create_dataset("indptr",  data=X.indptr,  compression="gzip")
+    m.create_dataset("shape",   data=np.array(X.shape, dtype=np.int64))
+
+    m.create_dataset("barcodes", data=barcodes, dtype=string_dt)
+
+    feats = m.create_group("features")
+    feats.create_dataset("id",           data=gene_ids,   dtype=string_dt)
+    feats.create_dataset("name",         data=gene_names, dtype=string_dt)
+    feats.create_dataset("feature_type", data=feature_type, dtype=string_dt)
+    feats.create_dataset("genome",       data=genome, dtype=string_dt)
+
+print(f"Saved: {out_path}")
+
+# Data generation for computational simulation
+expression_levels = (np.floor(np.exp((np.arange(1, gene_count + 1) - 36000) / 75)) + np.floor((np.maximum(0, np.arange(1, gene_count + 1) - 26301)) / 300)).astype(int)
+gene_count_vector = np.bincount(expanded_vector, minlength=gene_count + 1)[1:]
+gene_frequency_vector = gene_count_vector / len(expanded_vector)
+
+n_trials = 2000
+n_trials_dummy_1 = 1000
+n_trials_dummy_2 = 1000
+C_matrix = np.zeros((n_trials + n_trials_dummy_1 + n_trials_dummy_2, gene_count), dtype=int)
+
+for n in trange(n_trials):
+    np.random.seed(SEED + n)
+    k = int(np.maximum(500, np.random.normal(loc=mean_sampling, scale=std_sampling)))
+    sampled = np.random.choice(expanded_vector, size = k, replace=True)
+    counts = np.bincount(sampled, minlength=gene_count + 1)[1:]  # skip index 0
+    C_matrix[n, :] = counts
+
+np.random.seed(SEED)
+
+# dummy cells 1
+start_idx = 0
+end_idx = 36601
+unshuffled = expression_levels[start_idx:end_idx].copy()
+shuffled_part = expression_levels[start_idx:end_idx].copy()
+np.random.seed(SEED)
+np.random.shuffle(shuffled_part)
+expression_levels[start_idx:end_idx] = shuffled_part
+expanded_vector_dummy_1 = np.repeat(np.arange(1, gene_count + 1), expression_levels)
+
+for n in trange(n_trials_dummy_1):
+    np.random.seed(SEED + n)
+    k = int(np.maximum(500, np.random.normal(loc=mean_sampling, scale=std_sampling)))
+    sampled = np.random.choice(expanded_vector_dummy_1, size = k, replace=True)
+    counts = np.bincount(sampled, minlength=gene_count + 1)[1:]  # skip index 0
+    C_matrix[n + n_trials, :] = counts
+
+# Reset shuffle
+expression_levels[start_idx:end_idx] = unshuffled
+np.random.seed(SEED)
+
+# dummy cells 2
+start_idx = 0
+end_idx = 36601
+unshuffled = expression_levels[start_idx:end_idx].copy()
+shuffled_part = expression_levels[start_idx:end_idx].copy()
+np.random.seed(SEED * 2)
+np.random.shuffle(shuffled_part)
+expression_levels[start_idx:end_idx] = shuffled_part
+expanded_vector_dummy_2 = np.repeat(np.arange(1, gene_count + 1), expression_levels)
+
+for n in trange(n_trials_dummy_2):
+    np.random.seed(SEED + n)
+    k = int(np.maximum(500, np.random.normal(loc=mean_sampling, scale=std_sampling)))
+    sampled = np.random.choice(expanded_vector_dummy_2, size = k, replace=True)
+    counts = np.bincount(sampled, minlength=gene_count + 1)[1:]  # skip index 0
+    C_matrix[n + n_trials + n_trials_dummy_1, :] = counts
+
+# Reset shuffle
+expression_levels[start_idx:end_idx] = unshuffled
+np.random.seed(SEED)
+
+# Create pseudo-object
+out_path = os.path.expanduser("~/Desktop/zero_eim/filtered_feature_bc_matrix_cell_num_biased.h5")
+X = csc_matrix(C_matrix.T)  # (genes, cells)
+n_genes, n_cells = X.shape
+gene_ids   = np.array([f"gene_{i:06d}" for i in range(1, n_genes+1)], dtype=object)
+gene_names = np.array([f"GENE_{i:06d}" for i in range(1, n_genes+1)], dtype=object)
+feature_type = np.array(["Gene Expression"] * n_genes, dtype=object)
+genome = np.array(["na"] * n_genes, dtype=object)
+barcodes_real = [f"cell_{i:06d}_REAL" for i in range(1, n_trials + 1)]
+barcodes_d1   = [f"cell_{i:06d}_D1"   for i in range(1, n_trials_dummy_1 + 1)]
+barcodes_d2   = [f"cell_{i:06d}_D2"   for i in range(1, n_trials_dummy_2 + 1)]
+barcodes  = np.array(barcodes_real + barcodes_d1 + barcodes_d2, dtype=object)
+string_dt = h5py.string_dtype(encoding="utf-8")
+
+with h5py.File(out_path, "w") as f:
+    m = f.create_group("matrix")
+    m.create_dataset("data",    data=X.data,    compression="gzip")
+    m.create_dataset("indices", data=X.indices, compression="gzip")
+    m.create_dataset("indptr",  data=X.indptr,  compression="gzip")
+    m.create_dataset("shape",   data=np.array(X.shape, dtype=np.int64))
+
+    m.create_dataset("barcodes", data=barcodes, dtype=string_dt)
+
+    feats = m.create_group("features")
+    feats.create_dataset("id",           data=gene_ids,   dtype=string_dt)
+    feats.create_dataset("name",         data=gene_names, dtype=string_dt)
+    feats.create_dataset("feature_type", data=feature_type, dtype=string_dt)
+    feats.create_dataset("genome",       data=genome, dtype=string_dt)
+
+print(f"Saved: {out_path}")
+
+# Data generation for computational simulation
+expression_levels = (np.floor(np.exp((np.arange(1, gene_count + 1) - 36000) / 75)) + np.floor((np.maximum(0, np.arange(1, gene_count + 1) - 26301)) / 300)).astype(int)
+expanded_vector = np.repeat(np.arange(1, gene_count + 1), expression_levels)
+gene_count_vector = np.bincount(expanded_vector, minlength=gene_count + 1)[1:]
+gene_frequency_vector = gene_count_vector / len(expanded_vector)
+
+n_trials = 1000
+n_trials_dummy_1 = 1000   # slightly transiting from "Real"
+n_trials_dummy_2 = 1000   # further slightly transiting from "dummy_1"
+n_trials_dummy_3 = 1000   # differentiated from "dummy_2"
+n_trials_dummy_4 = 1000   # differentiated from "dummy_2" differently from 3
+C_matrix = np.zeros((n_trials + n_trials_dummy_1 + n_trials_dummy_2 + n_trials_dummy_3 + n_trials_dummy_4, gene_count), dtype=int)
+
+for n in trange(n_trials):
+    np.random.seed(SEED + n)
+    k = int(np.maximum(500, np.random.normal(loc=mean_sampling, scale=std_sampling)))
+    sampled = np.random.choice(expanded_vector, size = k, replace=True)
+    counts = np.bincount(sampled, minlength=gene_count + 1)[1:]  # skip index 0
+    C_matrix[n, :] = counts
+
+np.random.seed(SEED)
+
+# dummy cells 1
+low_id  = 26602
+high_id = 36601
+n_pick  = 300
+candidate_idx = np.arange(low_id - 1, high_id)
+picked_idx = np.random.choice(candidate_idx, size=n_pick, replace=False)
+factors = np.random.choice([1.67, 0.6], size=n_pick)
+unshuffled = expression_levels[picked_idx]
+scaled_values = np.floor(expression_levels[picked_idx] * factors).astype(int)
+expression_levels[picked_idx] = scaled_values
+expanded_vector_dummy_1 = np.repeat(np.arange(1, gene_count + 1), expression_levels)
+
+for n in trange(n_trials_dummy_1):
+    np.random.seed(SEED + n)
+    k = int(np.maximum(500, np.random.normal(loc=mean_sampling, scale=std_sampling)))
+    sampled = np.random.choice(expanded_vector_dummy_1, size = k, replace=True)
+    counts = np.bincount(sampled, minlength=gene_count + 1)[1:]  # skip index 0
+    C_matrix[n + n_trials, :] = counts
+
+np.random.seed(SEED)
+
+# dummy cells 2
+scaled_values = np.floor(expression_levels[picked_idx] * factors).astype(int)
+expression_levels[picked_idx] = scaled_values
+expanded_vector_dummy_2 = np.repeat(np.arange(1, gene_count + 1), expression_levels)
+
+for n in trange(n_trials_dummy_2):
+    np.random.seed(SEED + n)
+    k = int(np.maximum(500, np.random.normal(loc=mean_sampling, scale=std_sampling)))
+    sampled = np.random.choice(expanded_vector_dummy_2, size = k, replace=True)
+    counts = np.bincount(sampled, minlength=gene_count + 1)[1:]  # skip index 0
+    C_matrix[n + n_trials + n_trials_dummy_1, :] = counts
+
+expression_alternative = expression_levels
+np.random.seed(SEED)
+
+# dummy cells 3
+low_id  = 1
+high_id = 26601
+n_pick  = 10
+candidate_idx = np.arange(low_id - 1, high_id)
+picked_idx = np.random.choice(candidate_idx, size=n_pick, replace=False)
+print(picked_idx)
+
+factors = 50
+scaled_values = np.floor(expression_alternative[picked_idx] + factors).astype(int)
+expression_dummy_3 = expression_alternative.copy()
+expression_dummy_3[picked_idx] = scaled_values
+expanded_vector_dummy_3 = np.repeat(np.arange(1, gene_count + 1), expression_dummy_3)
+
+for n in trange(n_trials_dummy_3):
+    np.random.seed(SEED + n)
+    k = int(np.maximum(500, np.random.normal(loc=mean_sampling, scale=std_sampling)))
+    sampled = np.random.choice(expanded_vector_dummy_3, size = k, replace=True)
+    counts = np.bincount(sampled, minlength=gene_count + 1)[1:]  # skip index 0
+    C_matrix[n + n_trials + n_trials_dummy_1 + n_trials_dummy_2, :] = counts
+
+np.random.seed(SEED)
+
+# dummy cells 4
+low_id  = 1
+high_id = 26601
+n_pick  = 10
+candidate_idx = np.arange(low_id - 1, high_id)
+np.random.seed(SEED * 2)
+picked_idx = np.random.choice(candidate_idx, size=n_pick, replace=False)
+print(picked_idx)
+
+factors = 50
+scaled_values = np.floor(expression_alternative[picked_idx] + factors).astype(int)
+expression_dummy_4 = expression_alternative.copy()
+expression_dummy_4[picked_idx] = scaled_values
+expanded_vector_dummy_4 = np.repeat(np.arange(1, gene_count + 1), expression_dummy_4)
+
+for n in trange(n_trials_dummy_3):
+    np.random.seed(SEED + n)
+    k = int(np.maximum(500, np.random.normal(loc=mean_sampling, scale=std_sampling)))
+    sampled = np.random.choice(expanded_vector_dummy_4, size = k, replace=True)
+    counts = np.bincount(sampled, minlength=gene_count + 1)[1:]  # skip index 0
+    C_matrix[n + n_trials + n_trials_dummy_1 + n_trials_dummy_2 + n_trials_dummy_3, :] = counts
+
+np.random.seed(SEED)
+
+# Create pseudo-object
+out_path = os.path.expanduser("~/Desktop/zero_eim/filtered_feature_bc_matrix_trajectory.h5")
+X = csc_matrix(C_matrix.T)  # (genes, cells)
+n_genes, n_cells = X.shape
+gene_ids   = np.array([f"gene_{i:06d}" for i in range(1, n_genes+1)], dtype=object)
+gene_names = np.array([f"GENE_{i:06d}" for i in range(1, n_genes+1)], dtype=object)
+feature_type = np.array(["Gene Expression"] * n_genes, dtype=object)
+genome = np.array(["na"] * n_genes, dtype=object)
+barcodes_real = [f"cell_{i:06d}_REAL" for i in range(1, n_trials + 1)]
+barcodes_d1   = [f"cell_{i:06d}_D1"   for i in range(1, n_trials_dummy_1 + 1)]
+barcodes_d2   = [f"cell_{i:06d}_D2"   for i in range(1, n_trials_dummy_2 + 1)]
+barcodes_d3   = [f"cell_{i:06d}_D3"   for i in range(1, n_trials_dummy_3 + 1)]
+barcodes_d4   = [f"cell_{i:06d}_D4"   for i in range(1, n_trials_dummy_4 + 1)]
+barcodes  = np.array(barcodes_real + barcodes_d1 + barcodes_d2 + barcodes_d3 + barcodes_d4, dtype=object)
+string_dt = h5py.string_dtype(encoding="utf-8")
+
+with h5py.File(out_path, "w") as f:
+    m = f.create_group("matrix")
+    m.create_dataset("data",    data=X.data,    compression="gzip")
+    m.create_dataset("indices", data=X.indices, compression="gzip")
+    m.create_dataset("indptr",  data=X.indptr,  compression="gzip")
+    m.create_dataset("shape",   data=np.array(X.shape, dtype=np.int64))
+
+    m.create_dataset("barcodes", data=barcodes, dtype=string_dt)
+
+    feats = m.create_group("features")
+    feats.create_dataset("id",           data=gene_ids,   dtype=string_dt)
+    feats.create_dataset("name",         data=gene_names, dtype=string_dt)
+    feats.create_dataset("feature_type", data=feature_type, dtype=string_dt)
+    feats.create_dataset("genome",       data=genome, dtype=string_dt)
+
+print(f"Saved: {out_path}")
