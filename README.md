@@ -3,7 +3,7 @@ Title :
 Graph topology reframes the coherence of cell state manifold inference under heterogeneous single-cell observation
 
 Authors : 
-Tomohiro Tamura[*,†,1,2], Yusuke Yamane[*,1], Yuji Okano[1,3], Tetsuo Ishikawa[1,3,4], Kazuhiro Sakurada[1,5]
+Tomohiro Tamura(*,†,1,2), Yusuke Yamane(*,1), Yuji Okano(1,3), Tetsuo Ishikawa(1,3,4), Kazuhiro Sakurada(1,5)
 
 Affiliations : 
 * These authors contributed equally to this work.
