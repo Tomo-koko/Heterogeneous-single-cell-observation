@@ -73,7 +73,7 @@ plt.savefig("/path/to/your/dir/E_Nk_plot_linear_pbmc_poisson.png", dpi=300)
 plt.close()
 
 # E[N(k)] Plotting under Negative Binomial Distribution
-thetas = [0.01, 0.1, 0.3, 0.5, 1, 10]
+thetas = [0.1, 0.2, 0.3, 0.5, 1, 3, 10]
 mu = sample_count_pbmc * p  # Poisson λ_i for each gene
 
 E_nb_dict = {}
@@ -144,7 +144,7 @@ plt.savefig("/path/to/your/dir/E_Nk_plot_exp_pbmc_poisson.png", dpi=300)
 plt.close()
 
 # E[N(k)] Plotting under Negative Binomial Distribution
-thetas = [0.01, 0.1, 0.3, 0.5, 1, 10]
+thetas = [0.1, 0.2, 0.3, 0.5, 1, 3, 10]
 mu = sample_count_pbmc * p  # Poisson λ_i for each gene
 
 E_nb_dict = {}
