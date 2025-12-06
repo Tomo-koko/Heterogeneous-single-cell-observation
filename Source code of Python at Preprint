@@ -534,7 +534,7 @@ candidate_idx = np.arange(low_id - 1, high_id)
 picked_idx = np.random.choice(candidate_idx, size=n_pick, replace=False)
 print(picked_idx)
 
-factors = 50
+factors = 100
 scaled_values = np.floor(expression_alternative[picked_idx] + factors).astype(int)
 expression_dummy_3 = expression_alternative.copy()
 expression_dummy_3[picked_idx] = scaled_values
@@ -558,7 +558,7 @@ np.random.seed(SEED * 2)
 picked_idx = np.random.choice(candidate_idx, size=n_pick, replace=False)
 print(picked_idx)
 
-factors = 50
+factors = 100
 scaled_values = np.floor(expression_alternative[picked_idx] + factors).astype(int)
 expression_dummy_4 = expression_alternative.copy()
 expression_dummy_4[picked_idx] = scaled_values
@@ -610,6 +610,7 @@ print(f"Saved: {out_path}")
 print("Python:", sys.version)
 print("Executable:", sys.executable)
 print("Platform:", platform.platform())
+
 !pip list
 
 Python: 3.14.0 (main, Oct  7 2025, 09:34:52) [Clang 17.0.0 (clang-1700.0.13.3)]
