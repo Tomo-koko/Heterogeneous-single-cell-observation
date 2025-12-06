@@ -3219,3 +3219,7 @@ loaded via a namespace (and not attached):
 [129] ROCR_1.0-11                
 [130] igraph_2.2.1               
 [131] bit_4.6.0
+
+# SAVER
+packageVersion("SAVER") 
+[1] ‘1.1.2’
