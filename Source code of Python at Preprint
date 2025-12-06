@@ -613,7 +613,7 @@ print("Platform:", platform.platform())
 
 !pip list
 
-Python: 3.14.0 (main, Oct  7 2025, 09:34:52) [Clang 17.0.0 (clang-1700.0.13.3)]
+Python: 3.14.0 [Clang 17.0.0 (clang-1700.0.13.3)]
 Executable: /path/to/your/dir/.venv/bin/python3.14
 Platform: macOS-15.5-arm64-arm-64bit-Mach-O
 Package                   Version
