@@ -613,7 +613,10 @@ with h5py.File(out_path, "w") as f:
     feats.create_dataset("genome",       data=genome, dtype=string_dt)
 
 # === session info ===
+print("Python:", sys.version)
 !pip list
+
+Python: 3.11.11
 
 Package                   Version
 ------------------------- -----------
