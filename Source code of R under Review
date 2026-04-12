@@ -1,7 +1,11 @@
 # In this analysis, we used the generated data by computational simulation with Python.
 # Before running this code, please refer to the Python code.
 
-install.packages(c("hdf5r", "Seurat", "tidyverse", "reticulate", "R.utils", "SAVER", "htmlwidgets", "remotes", "BiocManager"))
+install.packages(c("Seurat", "tidyverse", "reticulate", "R.utils", "SAVER", "htmlwidgets", "remotes", "BiocManager"))
+
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+options(pkgType = "binary")
+install.packages(c("hdf5r", "Seurat", "tidyverse", "reticulate", "R.utils", "SAVER", "htmlwidgets", "remotes", "BiocManager", "progress"), type = "binary")
 
 # For the first time, you have to install miniconda via reticulate.
 # reticulate::install_miniconda()
@@ -10,7 +14,7 @@ remotes::install_github("mojaveazure/seurat-disk")
 BiocManager::install("zellkonverter")
 remotes::install_github("satijalab/seurat-wrappers")
 remotes::install_github("VivianStats/scImpute")
-reticulate::conda_create("r-scanpy", packages = "python=3.10")
+reticulate::conda_create("r-scanpy", packages = "python=3.11")
 reticulate::conda_install(
   envname  = "r-scanpy",
   packages = c("scanpy", "anndata", "numpy", "scipy", "pandas", "matplotlib", "h5py", "umap-learn", "python-igraph", "leidenalg", "pynndescent"),
@@ -35,6 +39,7 @@ library(reticulate)
 library(zellkonverter)
 library(scales)
 library(htmlwidgets)
+library(progress)
 
 # Fix seed
 set.seed(42)
@@ -172,7 +177,7 @@ plt <- layout(
 plt # choose "zoom"
 saveWidget(
   plt,
-  file = "/path/to/your/dir/Nk_hlpo_YMiaoetal_3d_plot.html",
+  file = "Nk_hlpo_YMiaoetal_3d_plot.html",
   selfcontained = TRUE
 )
 
@@ -201,12 +206,13 @@ seurat_mouse <- CreateSeuratObject(
   project      = "GSE133535_10X2x5Kcell250Kreads_mouse",
   meta.data    = mouse_meta
 )
-seurat_mouse@assays$RNA@layers$counts@Dim ## the number of genes and cells
-## 34900 10000
+seurat_mouse <- subset(seurat_mouse, subset = Species == "Mouse")
+seurat_mouse@assays$RNA@layers$counts@Dim ## the number of genes and cells from mouse
+## 34900 4996
 
 # Check UMI distributions
 seurat_mouse_umi <- subset(seurat_mouse,
-                          subset = nCount_RNA >= 1000 & nCount_RNA <= 40000)
+                           subset = nCount_RNA >= 1000 & nCount_RNA <= 40000)
 umi_counts <- seurat_mouse_umi$nCount_RNA
 
 png(filename = "umihist_mouse_global.png", width = 480, height = 320)
@@ -326,7 +332,94 @@ plt <- layout(
 plt # choose "zoom"
 saveWidget(
   plt,
-  file = "/path/to/your/dir/Nk_mouse_EMereuetal_3d_plot.html",
+  file = "Nk_mouse_EMereuetal_3d_plot.html",
+  selfcontained = TRUE
+)
+
+# Validation with mouse data
+num_neighbors <- floor(seurat_mouse@assays$RNA@layers$counts@Dim[[2]] / 50)
+seurat_mouse <- NormalizeData(seurat_mouse, normalization.method = "LogNormalize", scale.factor = 10000)
+seurat_mouse <- FindVariableFeatures(seurat_mouse, selection.method = "vst", nfeatures = 2000)
+seurat_mouse <- ScaleData(seurat_mouse)
+seurat_mouse <- RunPCA(seurat_mouse)
+seurat_mouse <- FindNeighbors(seurat_mouse, dims = 1:10, k.param = num_neighbors)
+seurat_mouse <- FindClusters(seurat_mouse, resolution = 0.05)
+seurat_mouse <- RunUMAP(seurat_mouse, dims = 1:10, n.neighbors = num_neighbors, metric = "euclidean")
+DimPlot(seurat_mouse)
+seurat_mouse$UnmapRatio <- seurat_mouse$nUnmappedReads / seurat_mouse$nTReads
+FeaturePlot(seurat_mouse, features = "UnmapRatio")
+VlnPlot(seurat_mouse, features = "UnmapRatio")
+
+# Extract putative tissue-derived cells with few unmapped reads within continuous manifold estimates
+seurat_mouse_put <- subset(seurat_mouse, subset = UnmapRatio < 0.1 & seurat_clusters == "0")
+num_neighbors <- floor(seurat_mouse_put@assays$RNA@layers$counts@Dim[[2]] / 50)
+seurat_mouse_put <- NormalizeData(seurat_mouse_put, normalization.method = "LogNormalize", scale.factor = 10000)
+seurat_mouse_put <- FindVariableFeatures(seurat_mouse_put, selection.method = "vst", nfeatures = 2000)
+seurat_mouse_put <- ScaleData(seurat_mouse_put)
+seurat_mouse_put <- RunPCA(seurat_mouse_put)
+
+seurat_mouse_put <- FindNeighbors(seurat_mouse_put, dims = 1:10, k.param = num_neighbors)
+seurat_mouse_put <- FindClusters(seurat_mouse_put, resolution = 0.3)
+seurat_mouse_put <- RunUMAP(seurat_mouse_put, dims = 1:10, n.neighbors = num_neighbors, metric = "euclidean")
+
+cl_levels <- levels(seurat_mouse_put$seurat_clusters)
+cluster_cols <- Seurat::DiscretePalette(length(cl_levels), palette = "parade")
+names(cluster_cols) <- cl_levels
+
+png(filename = "vln_mouse_traj_clusters.png", width = 480, height = 320)
+VlnPlot(seurat_mouse_put, 
+        group.by = "seurat_clusters",
+        features = "nCount_RNA",
+        cols     = cluster_cols,
+        pt.size = 0.01,
+        log = TRUE) + 
+  theme(plot.title = element_blank()) +
+  xlab("clusters") +
+  theme(axis.text.x = element_text(angle = 0, vjust = 0.5, hjust = 0.5))
+dev.off()
+
+png(filename = "umap_mouse_traj_clusters.png", width = 480, height = 320)
+DimPlot(seurat_mouse_put, 
+        group.by = "seurat_clusters", 
+        label = FALSE,
+        cols     = cluster_cols,
+        pt.size = 1) + 
+  theme(plot.title = element_blank()) + 
+  NoAxes()
+dev.off()
+
+# Hierarchical analysis
+emb <- Embeddings(seurat_mouse_put, reduction = "umap")[, 1:2]
+meta <- seurat_mouse_put@meta.data[, c("nCount_RNA", "seurat_clusters")]
+df <- data.frame(
+  UMAP_1 = emb[,1],
+  UMAP_2 = emb[,2],
+  nCount_RNA = meta$nCount_RNA,
+  seurat_clusters = meta$seurat_clusters
+)
+df$log10_nCount <- log10(df$nCount_RNA)
+
+p3d_mouse_cluster <- plot_ly(
+  df,
+  x = ~UMAP_1, y = ~UMAP_2, z = ~log10_nCount,
+  color = ~seurat_clusters, 
+  colors = unname(cluster_cols),          
+  type = "scatter3d", mode = "markers",
+  marker = list(size = 2, opacity = 1)
+) %>% 
+  layout(
+    scene = list(
+      xaxis = list(title = "UMAP 1"),
+      yaxis = list(title = "UMAP 2"),
+      zaxis = list(title = "log10(Total UMI counts)")   
+    ),
+    legend = list(orientation = "h", y = 1.05)
+  )
+
+p3d_mouse_cluster # choose Zoom
+saveWidget(
+  p3d_mouse_cluster,
+  file = "trajectory_mouse_clusters_3d_plot.html",
   selfcontained = TRUE
 )
 
@@ -459,7 +552,7 @@ plt <- layout(
 plt # choose "zoom"
 saveWidget(
   plt,
-  file = "/path/to/your/dir/Nk_pbmc_10X_3d_plot.html",
+  file = "Nk_pbmc_10X_3d_plot.html",
   selfcontained = TRUE
 )
 
@@ -503,82 +596,7 @@ ggplot(plot_df2, aes(x = count, y = y_plot, color = bin_fac, group = bin_fac)) +
 dev.off()
 
 # Plot E[N(k)] under Poisson sampling
-csv_path <- "/path/to/your/dir/E_Nk_combo_poisson_depth_grid.csv"
-df <- read_csv(csv_path,
-    col_types      = cols(
-    depth          = col_double(),
-    k              = col_integer(),
-    expected_genes = col_double()))
-max_k_show <- max(df$k)
-
-eps <- 1
-plot_df <- df %>%
-  filter(k <= max_k_show) %>%
-  mutate(
-    y_val   = pmax(expected_genes, eps),
-    y_log10 = log10(y_val)
-  )
-
-plt <- plot_ly()
-
-for (d in sort(unique(plot_df$depth))) {
-  df_d <- filter(plot_df, depth == d)
-  
-  plt <- add_trace(
-    plt,
-    data  = df_d,
-    x     = ~k,
-    y     = ~y_log10,
-    z     = ~depth,
-    type  = "scatter3d",
-    mode  = "lines+markers",
-    name  = paste0("Depth ", d),
-    marker = list(size = 2),
-    customdata = df_d$y_val,
-    hovertemplate = paste0(
-      "Depth: ", d, "<br>",
-      "k: %{x}<br>",
-      "E[N(k)]: %{customdata:.3f}<extra></extra>"
-    )
-  )
-}
-
-plt <- layout(
-  plt,
-  scene = list(
-    xaxis = list(
-      title    = "UMI count per gene (k)",
-      tickmode = "linear",
-      tick0    = 0,
-      dtick    = 10,
-      showgrid = TRUE
-    ),
-    yaxis = list(
-      title = "log10 E[N(k)]"
-    ),
-    zaxis = list(
-      title = "Sampling depth (total UMIs)"
-    ),
-    xaxis_showspikes = FALSE,
-    yaxis_showspikes = FALSE,
-    zaxis_showspikes = FALSE
-  ),
-  legend = list(
-    orientation = "h",
-    x = 0,
-    y = 1.05
-  )
-)
-
-plt # choose Zoom
-saveWidget(
-   plt,
-   file = "/path/to/your/dir/E_Nk_combo_Poisson_3d_plot.html",
-   selfcontained = TRUE
-  )
-
-# Plot E[N(k)] under NB sampling with theta = 0.5
-csv_path <- "/path/to/your/dir/E_Nk_combo_nb_depth_grid.csv"
+csv_path <- "E_Nk_combo_poisson_depth_grid.csv"
 df <- read_csv(csv_path,
                col_types      = cols(
                  depth          = col_double(),
@@ -648,12 +666,87 @@ plt <- layout(
 plt # choose Zoom
 saveWidget(
   plt,
-  file = "/path/to/your/dir/E_Nk_combo_nb_3d_plot.html",
+  file = "E_Nk_combo_Poisson_3d_plot.html",
+  selfcontained = TRUE
+)
+
+# Plot E[N(k)] under NB sampling with theta = 0.5
+csv_path <- "E_Nk_combo_nb_depth_grid.csv"
+df <- read_csv(csv_path,
+               col_types      = cols(
+                 depth          = col_double(),
+                 k              = col_integer(),
+                 expected_genes = col_double()))
+max_k_show <- max(df$k)
+
+eps <- 1
+plot_df <- df %>%
+  filter(k <= max_k_show) %>%
+  mutate(
+    y_val   = pmax(expected_genes, eps),
+    y_log10 = log10(y_val)
+  )
+
+plt <- plot_ly()
+
+for (d in sort(unique(plot_df$depth))) {
+  df_d <- filter(plot_df, depth == d)
+  
+  plt <- add_trace(
+    plt,
+    data  = df_d,
+    x     = ~k,
+    y     = ~y_log10,
+    z     = ~depth,
+    type  = "scatter3d",
+    mode  = "lines+markers",
+    name  = paste0("Depth ", d),
+    marker = list(size = 2),
+    customdata = df_d$y_val,
+    hovertemplate = paste0(
+      "Depth: ", d, "<br>",
+      "k: %{x}<br>",
+      "E[N(k)]: %{customdata:.3f}<extra></extra>"
+    )
+  )
+}
+
+plt <- layout(
+  plt,
+  scene = list(
+    xaxis = list(
+      title    = "UMI count per gene (k)",
+      tickmode = "linear",
+      tick0    = 0,
+      dtick    = 10,
+      showgrid = TRUE
+    ),
+    yaxis = list(
+      title = "log10 E[N(k)]"
+    ),
+    zaxis = list(
+      title = "Sampling depth (total UMIs)"
+    ),
+    xaxis_showspikes = FALSE,
+    yaxis_showspikes = FALSE,
+    zaxis_showspikes = FALSE
+  ),
+  legend = list(
+    orientation = "h",
+    x = 0,
+    y = 1.05
+  )
+)
+
+plt # choose Zoom
+saveWidget(
+  plt,
+  file = "E_Nk_combo_nb_3d_plot.html",
   selfcontained = TRUE
 )
 
 # Analyze pseudo-object
-mat <- Read10X_h5("/path/to/your/dir/filtered_feature_bc_matrix_trivial_change.h5")
+mat <- Read10X_h5("filtered_feature_bc_matrix_trivial_change.h5")
 seurat_pseudo <- CreateSeuratObject(mat)
 seurat_pseudo$group <- sub(".*_(REAL|D1)$", "\\1", colnames(seurat_pseudo))
 seurat_pseudo$group <- dplyr::recode(seurat_pseudo$group, REAL = "Cell 1", D1 = "Cell 4")
@@ -745,7 +838,7 @@ p3d_pseudo_cluster <- plot_ly(
 p3d_pseudo_cluster # choose Zoom
 saveWidget(
   p3d_pseudo_cluster,
-  file = "/path/to/your/dir/trivial_change_global_clusters_3d_plot.html",
+  file = "trivial_change_global_clusters_3d_plot.html",
   selfcontained = TRUE
 )
 
@@ -768,7 +861,7 @@ p3d_pseudo_group <- plot_ly(
 p3d_pseudo_group # choose Zoom
 saveWidget(
   p3d_pseudo_group,
-  file = "/path/to/your/dir/trivial_change_global_group_3d_plot.html",
+  file = "trivial_change_global_group_3d_plot.html",
   selfcontained = TRUE
 )
 
@@ -813,7 +906,7 @@ DimPlot(seurat_pseudo_subset,
 dev.off()
 
 # Analyze pseudo-object
-mat <- Read10X_h5("/path/to/your/dir/filtered_feature_bc_matrix_cell_num_biased.h5")
+mat <- Read10X_h5("filtered_feature_bc_matrix_cell_num_biased.h5")
 seurat_pseudo <- CreateSeuratObject(mat)
 seurat_pseudo$group <- sub(".*_(REAL|D1|D2)$", "\\1", colnames(seurat_pseudo))
 seurat_pseudo$group <- dplyr::recode(seurat_pseudo$group, REAL = "Cell 1", D1 = "Cell 2", D2 = "Cell 3")
@@ -904,7 +997,7 @@ p3d_pseudo_cluster <- plot_ly(
 p3d_pseudo_cluster # choose Zoom
 saveWidget(
   p3d_pseudo_cluster,
-  file = "/path/to/your/dir/cell_num_biased_clusters_3d_plot.html",
+  file = "cell_num_biased_clusters_3d_plot.html",
   selfcontained = TRUE
 )
 
@@ -927,12 +1020,12 @@ p3d_pseudo_group <- plot_ly(
 p3d_pseudo_group # choose Zoom
 saveWidget(
   p3d_pseudo_group,
-  file = "/path/to/your/dir/cell_num_biased_group_3d_plot.html",
+  file = "cell_num_biased_group_3d_plot.html",
   selfcontained = TRUE
 )
 
 # Analyze pseudo-object in terms of trajectory
-mat <- Read10X_h5("/path/to/your/dir/filtered_feature_bc_matrix_trajectory.h5")
+mat <- Read10X_h5("filtered_feature_bc_matrix_trajectory.h5")
 seurat_pseudo <- CreateSeuratObject(mat)
 seurat_pseudo$group <- sub(".*_(REAL|D1|D2|D3|D4)$", "\\1", colnames(seurat_pseudo))
 seurat_pseudo$group <- dplyr::recode(seurat_pseudo$group, REAL = "Cell A", D1 = "Cell B", D2 = "Cell C", D3 = "Cell D", D4 = "Cell E")
@@ -1108,7 +1201,7 @@ p3d_pseudo_cluster <- plot_ly(
 p3d_pseudo_cluster # choose Zoom
 saveWidget(
   p3d_pseudo_cluster,
-  file = "/path/to/your/dir/trajectory_global_clusters_3d_plot.html",
+  file = "trajectory_global_clusters_3d_plot.html",
   selfcontained = TRUE
 )
 
@@ -1131,7 +1224,7 @@ p3d_pseudo_group <- plot_ly(
 p3d_pseudo_group
 saveWidget(
   p3d_pseudo_group,
-  file = "/path/to/your/dir/trajectory_global_group_3d_plot.html",
+  file = "trajectory_global_group_3d_plot.html",
   selfcontained = TRUE
 )
 
@@ -1322,7 +1415,7 @@ p3d_global <- plot_ly(
 p3d_global     # choose "Zoom"
 saveWidget(
   p3d_global,
-  file = "/path/to/your/dir/pbmc_global_clusters_3d_plot.html",
+  file = "pbmc_global_clusters_3d_plot.html",
   selfcontained = TRUE
 )
 
@@ -1428,7 +1521,7 @@ p3d_II_global <- plot_ly(
 p3d_II_global     # choose "Zoom"
 saveWidget(
   p3d_II_global,
-  file = "/path/to/your/dir/pbmc_confused_Mono_subset_of_globalUMAP_clusters_3d_plot.html",
+  file = "pbmc_confused_Mono_subset_of_globalUMAP_clusters_3d_plot.html",
   selfcontained = TRUE
 )
 
@@ -1508,8 +1601,8 @@ dev.off()
 # Reanalyze monocyte singlet population
 seurat_pbmc_filtered_II <- subset(seurat_pbmc_filtered_II,
                                   subset = seurat_clusters != 6 &
-                                           seurat_clusters != 8 &
-                                           seurat_clusters != 9)
+                                    seurat_clusters != 8 &
+                                    seurat_clusters != 9)
 num_neighbors <- floor(seurat_pbmc_filtered_II@assays$RNA@layers$counts@Dim[[2]] / 100)
 
 seurat_pbmc_filtered_II <- NormalizeData(seurat_pbmc_filtered_II, normalization.method = "LogNormalize", scale.factor = 10000)
@@ -1669,7 +1762,7 @@ p3d_II <- plot_ly(
 p3d_II               # choose "Zoom"
 saveWidget(
   p3d_II,
-  file = "/path/to/your/dir/pbmc_Mono_clusters_3d_plot.html",
+  file = "pbmc_Mono_clusters_3d_plot.html",
   selfcontained = TRUE
 )
 
@@ -1778,7 +1871,7 @@ p3d_II_valid <- plot_ly(
 p3d_II_valid     # Choose "zoom"
 saveWidget(
   p3d_II_valid,
-  file = "/path/to/your/dir/pbmc_good_UMI_Mono_clusters_3d_plot.html",
+  file = "pbmc_good_UMI_Mono_clusters_3d_plot.html",
   selfcontained = TRUE
 )
 
@@ -2426,8 +2519,8 @@ for (i in seq_along(k_values)) {
   seu_reliable <- FindClusters(seu_reliable, resolution = 1, verbose = FALSE)
   seu_reliable <- RunUMAP(seu_reliable, dims = 1:30, n.neighbors = num_neighbors, verbose = FALSE, metric = "euclidean")
   
-  m_counts <- GetAssayData(seu_reliable, assay = "RNA", slot = "counts")
-  m_data   <- GetAssayData(seu_reliable, assay = "RNA", slot = "data")
+  m_counts <- GetAssayData(seu_reliable, assay = "RNA", layer = "counts")
+  m_data   <- GetAssayData(seu_reliable, assay = "RNA", layer = "data")
   sce <- as.SingleCellExperiment(seu_reliable, assay = "RNA")
   SummarizedExperiment::assay(sce, "counts")    <- as(m_counts, "dgCMatrix")
   SummarizedExperiment::assay(sce, "logcounts") <- as(m_data,   "dgCMatrix")
@@ -2532,7 +2625,2303 @@ for (i in seq_along(k_values)) {
 }
 
 betti_df <- do.call(rbind, betti_list)
-write.csv(betti_df, file = "betti_df.csv", row.names = FALSE)
+write.csv(betti_df, file = "betti_df_default.csv", row.names = FALSE)
+
+# Subsampling comparison
+th_HitRate  <- quantile(meta_loss$RW_HitRate, probs = 50 / 100, na.rm = TRUE)
+good_loss_cells <- rownames(meta_loss)[meta_loss$RW_HitRate > th_HitRate]
+valid_cells <- colnames(seu_all)[is_labeled]
+cells_to_keep <- c(valid_cells, good_loss_cells)
+seurat_pbmc_filtered_II_rw <- subset(seu_all, cells = cells_to_keep)
+
+thr <- 0.05
+n_iter <- 100
+sample_n <- 1500
+
+seu_list <- list(
+  filtered_II       = seurat_pbmc_filtered_II,
+  filtered_II_rw    = seurat_pbmc_filtered_II_rw,
+  filtered_II_valid = seurat_pbmc_filtered_II_valid
+)
+
+betti_list <- vector("list", length(seu_list) * n_iter)
+idx <- 1L
+
+pb <- progress_bar$new(
+  format = "  [:bar] :percent  eta: :eta  elapsed: :elapsed  :message",
+  total = length(seu_list) * n_iter,
+  clear = FALSE,
+  width = 80
+)
+
+for (sample_name in names(seu_list)) {
+  seu_src <- seu_list[[sample_name]]
+  
+  for (iter in seq_len(n_iter)) {
+    pb$tick(tokens = list(message = paste(sample_name, "iter", iter)))
+    
+    set.seed(42 + iter)
+    sampled_cells <- sample(colnames(seu_src), size = sample_n, replace = FALSE)
+    seu_sub <- subset(seu_src, cells = sampled_cells)
+    
+    num_neighbors <- floor(ncol(seu_sub) / 100)
+    
+    seu_sub <- NormalizeData(
+      seu_sub,
+      normalization.method = "LogNormalize",
+      scale.factor = 10000,
+      verbose = FALSE
+    )
+    seu_sub <- FindVariableFeatures(
+      seu_sub,
+      selection.method = "vst",
+      nfeatures = 2000,
+      verbose = FALSE
+    )
+    seu_sub <- ScaleData(seu_sub, verbose = FALSE)
+    seu_sub <- RunPCA(seu_sub, verbose = FALSE)
+    seu_sub <- FindNeighbors(
+      seu_sub,
+      dims = 1:30,
+      k.param = num_neighbors,
+      verbose = FALSE
+    )
+    seu_sub <- FindClusters(
+      seu_sub,
+      resolution = 1,
+      verbose = FALSE
+    )
+    
+    m_counts <- GetAssayData(seu_sub, assay = "RNA", layer = "counts")
+    m_data   <- GetAssayData(seu_sub, assay = "RNA", layer = "data")
+    
+    sce <- as.SingleCellExperiment(seu_sub, assay = "RNA")
+    SummarizedExperiment::assay(sce, "counts")    <- as(m_counts, "dgCMatrix")
+    SummarizedExperiment::assay(sce, "logcounts") <- as(m_data, "dgCMatrix")
+    
+    if ("pca" %in% Reductions(seu_sub)) {
+      SingleCellExperiment::reducedDim(sce, "X_pca") <- Embeddings(seu_sub, "pca")
+    }
+    
+    tmp_h5ad <- tempfile(fileext = ".h5ad")
+    zellkonverter::writeH5AD(sce, tmp_h5ad)
+    
+    adata <- sc$read_h5ad(tmp_h5ad)
+    unlink(tmp_h5ad)
+    
+    adata$obs["seurat_clusters"] <- adata$obs["seurat_clusters"]$astype("category")
+    
+    Xp <- adata$obsm$get("X_pca")
+    if (py_has_attr(Xp, "values")) {
+      Xp <- Xp$values
+    }
+    Xp <- np$ascontiguousarray(np$asarray(Xp, dtype = "float32"))
+    adata$obsm$`__setitem__`("X_pca", Xp)
+    
+    n_pcs_use <- as.integer(min(30L, ncol(Embeddings(seu_sub, "pca"))))
+    
+    sc$pp$neighbors(
+      adata,
+      use_rep = "X_pca",
+      n_neighbors = as.integer(num_neighbors),
+      n_pcs = n_pcs_use
+    )
+    sc$tl$paga(adata, groups = "seurat_clusters")
+    
+    paga_conn <- adata$uns[["paga"]][["connectivities"]]
+    paga_mat  <- py_to_r(paga_conn$toarray())
+    paga_mat[paga_mat < thr] <- 0
+    
+    g <- igraph::graph_from_adjacency_matrix(
+      paga_mat,
+      mode = "undirected",
+      weighted = TRUE,
+      diag = FALSE
+    )
+    g <- igraph::simplify(g, remove.multiple = TRUE, remove.loops = TRUE)
+    
+    comp  <- igraph::components(g)
+    beta0 <- comp$no
+    V     <- igraph::vcount(g)
+    E     <- igraph::ecount(g)
+    beta1 <- E - V + beta0
+    
+    betti_list[[idx]] <- data.frame(
+      sample = sample_name,
+      iter = iter,
+      n_cells = ncol(seu_sub),
+      num_neighbors = num_neighbors,
+      num_clusters = V,
+      beta0 = beta0,
+      beta1 = beta1,
+      stringsAsFactors = FALSE
+    )
+    
+    idx <- idx + 1L
+  }
+}
+
+betti_boot_df <- do.call(rbind, betti_list)
+rownames(betti_boot_df) <- NULL
+
+plot_df <- betti_boot_df
+plot_df$sample <- factor(
+  plot_df$sample,
+  levels = c("filtered_II", "filtered_II_rw", "filtered_II_valid")
+)
+
+p_beta1 <- ggplot(plot_df, aes(x = sample, y = beta1, fill = sample)) +
+  geom_boxplot(
+    width = 0.15,
+    outlier.shape = NA,
+    color = "black",
+    median.color = "red",
+    median.linewidth = 1.5
+  ) +
+  stat_boxplot(
+    geom = "errorbar",
+    width = 0.08,
+    color = "black"
+  ) +
+  scale_x_discrete(
+    breaks = c("filtered_II", "filtered_II_rw", "filtered_II_valid"),
+    labels = expression(
+      M,
+      M[50 * "%"],
+      M * "'"
+    )
+  ) +
+  scale_fill_manual(
+    values = c(
+      "filtered_II" = "steelblue",
+      "filtered_II_rw" = "gray",
+      "filtered_II_valid" = "darkorange"
+    )
+  ) +
+  coord_cartesian(ylim = c(0, 12)) +
+  labs(
+    x = NULL,
+    y = "First Betti number"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 0, hjust = 0.5)
+  )
+
+p_beta1
+ggsave("box_beta1_default.png", p_beta1, width = 4.5, height = 4, dpi = 600)
+
+# Sensitivity analysis of hyperparameters
+# walk counts
+# T = 10
+num_neighbors <- floor(seu_all@assays$RNA@layers$counts@Dim[[2]] / 100)
+seu_all <- FindNeighbors(seu_all, dims = 1:30, k.param = num_neighbors)
+seu_all <- FindClusters(seu_all, resolution = 1)
+seu_all <- RunUMAP(seu_all, dims = 1:30, n.neighbors = num_neighbors, metric = "euclidean")
+
+# Remove "back-doors"
+n_walks <- 1000        # number of random walks per cell (k)
+T_max   <- 10       # maximum steps per walk (T)
+info_loss_label <- "Low-information cells"
+info_annot <- seu_all$InfoAnnotation
+cell_names <- colnames(seu_all)
+is_labeled <- info_annot != info_loss_label
+label_vec  <- info_annot           # biological labels or "Low-information cells"
+bio_labels <- sort(unique(label_vec[is_labeled]))
+K <- length(bio_labels)
+
+# Extract SNN graph and construct transition probabilities
+graph_name <- grep("_snn$", names(seu_all@graphs), value = TRUE)[1]
+A <- seu_all@graphs[[graph_name]]  # dgCMatrix adjacency matrix
+diag(A) <- 0    # remove self-loop 
+A_col <- t(A) 
+n_cells <- ncol(A_col)
+stopifnot(identical(colnames(A_col), cell_names))     # Sanity check: column order should match cell_names
+neighbors_list <- vector("list", n_cells)
+probs_list     <- vector("list", n_cells)
+
+# dgCMatrix is column-compressed:
+#  - @p: pointers to start of each column (length ncol + 1)
+#  - @i: row indices (0-based)
+#  - @x: non-zero values
+for (j in seq_len(n_cells)) {
+  col_start <- A_col@p[j] + 1
+  col_end   <- A_col@p[j + 1]
+  
+  if (col_end >= col_start) {
+    rows <- A_col@i[col_start:col_end] + 1  # row indices (1-based)
+    w    <- A_col@x[col_start:col_end]      # edge weights
+    neighbors_list[[j]] <- rows
+    probs_list[[j]]     <- w / sum(w)
+  } else {
+    neighbors_list[[j]] <- integer(0)
+    probs_list[[j]]     <- numeric(0)
+  }
+}
+
+# Map cell name -> index
+cell_index <- seq_len(n_cells)
+names(cell_index) <- colnames(A_col)
+
+# Compute random-walk-based metrics for Informational Loss cells
+# Initialize result vectors
+HitRate       <- rep(NA_real_, n_cells)
+TopAnnotation <- rep(NA_character_, n_cells)
+
+names(HitRate)       <- cell_names
+names(TopAnnotation) <- cell_names
+
+loss_cells <- which(!is_labeled)     # Indices of Informational Loss cells
+
+# To record cells that never hit any labeled cell
+no_hit_cells <- character(0L)
+
+for (idx in loss_cells) {
+  start_name <- cell_names[idx]
+  
+  # Run random walks
+  hits <- character(n_walks)
+  for (w in seq_len(n_walks)) {
+    hits[w] <- random_walk_first_hit(
+      start_idx      = idx,
+      neighbors_list = neighbors_list,
+      probs_list     = probs_list,
+      is_labeled     = is_labeled,
+      label_vec      = label_vec,
+      T_max          = T_max
+    )
+  }
+  
+  # Separate hit vs no-hit
+  hit_labels <- hits[!is.na(hits)]
+  s <- length(hit_labels)     # total hits
+  r <- s / n_walks            # hit rate
+  
+  HitRate[idx] <- r
+  
+  if (s == 0L) {
+    # No hits: record NA and keep for alert
+    TopAnnotation[idx] <- NA_character_
+    no_hit_cells <- c(no_hit_cells, start_name)
+  } else {
+    # Empirical distribution over biological labels
+    tab <- table(hit_labels)
+    
+    # Most frequent InfoAnnotation
+    top_label <- names(tab)[which.max(tab)]
+    
+    TopAnnotation[idx] <- top_label
+  }
+}
+
+# For labeled cells, set to NA (RW-based metrics are defined only for loss cells)
+HitRate[is_labeled]       <- NA_real_
+TopAnnotation[is_labeled] <- NA_character_
+
+# Store into meta.data
+seu_all$RW_HitRate       <- HitRate
+seu_all$RW_TopAnnotation <- TopAnnotation
+
+# Reliability of Informational Loss cells on UMAP
+seu_loss <- subset(seu_all, subset = InfoAnnotation == "Low-information cells")
+df <- FetchData(seu_loss, vars = c("nCount_RNA", "RW_HitRate"))
+meta_loss <- seu_all@meta.data[!is_labeled, , drop = FALSE]
+
+# Subsampling comparison
+th_HitRate  <- quantile(meta_loss$RW_HitRate, probs = 50 / 100, na.rm = TRUE)
+good_loss_cells <- rownames(meta_loss)[meta_loss$RW_HitRate > th_HitRate]
+valid_cells <- colnames(seu_all)[is_labeled]
+cells_to_keep <- c(valid_cells, good_loss_cells)
+seurat_pbmc_filtered_II_rw <- subset(seu_all, cells = cells_to_keep)
+
+thr <- 0.05
+n_iter <- 100
+sample_n <- 1500
+
+seu_list <- list(
+  filtered_II       = seurat_pbmc_filtered_II,
+  filtered_II_rw    = seurat_pbmc_filtered_II_rw,
+  filtered_II_valid = seurat_pbmc_filtered_II_valid
+)
+
+betti_list <- vector("list", length(seu_list) * n_iter)
+idx <- 1L
+
+pb <- progress_bar$new(
+  format = "  [:bar] :percent  eta: :eta  elapsed: :elapsed  :message",
+  total = length(seu_list) * n_iter,
+  clear = FALSE,
+  width = 80
+)
+
+for (sample_name in names(seu_list)) {
+  seu_src <- seu_list[[sample_name]]
+  
+  for (iter in seq_len(n_iter)) {
+    pb$tick(tokens = list(message = paste(sample_name, "iter", iter)))
+    
+    set.seed(42 + iter)
+    sampled_cells <- sample(colnames(seu_src), size = sample_n, replace = FALSE)
+    seu_sub <- subset(seu_src, cells = sampled_cells)
+    
+    num_neighbors <- floor(ncol(seu_sub) / 100)
+    
+    seu_sub <- NormalizeData(
+      seu_sub,
+      normalization.method = "LogNormalize",
+      scale.factor = 10000,
+      verbose = FALSE
+    )
+    seu_sub <- FindVariableFeatures(
+      seu_sub,
+      selection.method = "vst",
+      nfeatures = 2000,
+      verbose = FALSE
+    )
+    seu_sub <- ScaleData(seu_sub, verbose = FALSE)
+    seu_sub <- RunPCA(seu_sub, verbose = FALSE)
+    seu_sub <- FindNeighbors(
+      seu_sub,
+      dims = 1:30,
+      k.param = num_neighbors,
+      verbose = FALSE
+    )
+    seu_sub <- FindClusters(
+      seu_sub,
+      resolution = 1,
+      verbose = FALSE
+    )
+    
+    m_counts <- GetAssayData(seu_sub, assay = "RNA", layer = "counts")
+    m_data   <- GetAssayData(seu_sub, assay = "RNA", layer = "data")
+    
+    sce <- as.SingleCellExperiment(seu_sub, assay = "RNA")
+    SummarizedExperiment::assay(sce, "counts")    <- as(m_counts, "dgCMatrix")
+    SummarizedExperiment::assay(sce, "logcounts") <- as(m_data, "dgCMatrix")
+    
+    if ("pca" %in% Reductions(seu_sub)) {
+      SingleCellExperiment::reducedDim(sce, "X_pca") <- Embeddings(seu_sub, "pca")
+    }
+    
+    tmp_h5ad <- tempfile(fileext = ".h5ad")
+    zellkonverter::writeH5AD(sce, tmp_h5ad)
+    
+    adata <- sc$read_h5ad(tmp_h5ad)
+    unlink(tmp_h5ad)
+    
+    adata$obs["seurat_clusters"] <- adata$obs["seurat_clusters"]$astype("category")
+    
+    Xp <- adata$obsm$get("X_pca")
+    if (py_has_attr(Xp, "values")) {
+      Xp <- Xp$values
+    }
+    Xp <- np$ascontiguousarray(np$asarray(Xp, dtype = "float32"))
+    adata$obsm$`__setitem__`("X_pca", Xp)
+    
+    n_pcs_use <- as.integer(min(30L, ncol(Embeddings(seu_sub, "pca"))))
+    
+    sc$pp$neighbors(
+      adata,
+      use_rep = "X_pca",
+      n_neighbors = as.integer(num_neighbors),
+      n_pcs = n_pcs_use
+    )
+    sc$tl$paga(adata, groups = "seurat_clusters")
+    
+    paga_conn <- adata$uns[["paga"]][["connectivities"]]
+    paga_mat  <- py_to_r(paga_conn$toarray())
+    paga_mat[paga_mat < thr] <- 0
+    
+    g <- igraph::graph_from_adjacency_matrix(
+      paga_mat,
+      mode = "undirected",
+      weighted = TRUE,
+      diag = FALSE
+    )
+    g <- igraph::simplify(g, remove.multiple = TRUE, remove.loops = TRUE)
+    
+    comp  <- igraph::components(g)
+    beta0 <- comp$no
+    V     <- igraph::vcount(g)
+    E     <- igraph::ecount(g)
+    beta1 <- E - V + beta0
+    
+    betti_list[[idx]] <- data.frame(
+      sample = sample_name,
+      iter = iter,
+      n_cells = ncol(seu_sub),
+      num_neighbors = num_neighbors,
+      num_clusters = V,
+      beta0 = beta0,
+      beta1 = beta1,
+      stringsAsFactors = FALSE
+    )
+    
+    idx <- idx + 1L
+  }
+}
+
+betti_boot_df <- do.call(rbind, betti_list)
+rownames(betti_boot_df) <- NULL
+write.csv(betti_boot_df, file = "betti_df_T10.csv", row.names = FALSE)
+
+plot_df <- betti_boot_df
+plot_df$sample <- factor(
+  plot_df$sample,
+  levels = c("filtered_II", "filtered_II_rw", "filtered_II_valid")
+)
+
+p_beta1 <- ggplot(plot_df, aes(x = sample, y = beta1, fill = sample)) +
+  geom_boxplot(
+    width = 0.15,
+    outlier.shape = NA,
+    color = "black",
+    median.color = "red",
+    median.linewidth = 1.5
+  ) +
+  stat_boxplot(
+    geom = "errorbar",
+    width = 0.08,
+    color = "black"
+  ) +
+  scale_x_discrete(
+    breaks = c("filtered_II", "filtered_II_rw", "filtered_II_valid"),
+    labels = expression(
+      M,
+      M[50 * "%"],
+      M * "'"
+    )
+  ) +
+  scale_fill_manual(
+    values = c(
+      "filtered_II" = "steelblue",
+      "filtered_II_rw" = "gray",
+      "filtered_II_valid" = "darkorange"
+    )
+  ) +
+  coord_cartesian(ylim = c(0, 12)) +
+  labs(
+    x = NULL,
+    y = "First Betti number"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 0, hjust = 0.5)
+  )
+
+p_beta1
+ggsave("box_beta1_T10.png", p_beta1, width = 4.5, height = 4, dpi = 600)
+
+# T = 20
+num_neighbors <- floor(seu_all@assays$RNA@layers$counts@Dim[[2]] / 100)
+seu_all <- FindNeighbors(seu_all, dims = 1:30, k.param = num_neighbors)
+seu_all <- FindClusters(seu_all, resolution = 1)
+seu_all <- RunUMAP(seu_all, dims = 1:30, n.neighbors = num_neighbors, metric = "euclidean")
+
+# Remove "back-doors"
+n_walks <- 1000        # number of random walks per cell (k)
+T_max   <- 20       # maximum steps per walk (T)
+info_loss_label <- "Low-information cells"
+info_annot <- seu_all$InfoAnnotation
+cell_names <- colnames(seu_all)
+is_labeled <- info_annot != info_loss_label
+label_vec  <- info_annot           # biological labels or "Low-information cells"
+bio_labels <- sort(unique(label_vec[is_labeled]))
+K <- length(bio_labels)
+
+# Extract SNN graph and construct transition probabilities
+graph_name <- grep("_snn$", names(seu_all@graphs), value = TRUE)[1]
+A <- seu_all@graphs[[graph_name]]  # dgCMatrix adjacency matrix
+diag(A) <- 0    # remove self-loop 
+A_col <- t(A) 
+n_cells <- ncol(A_col)
+stopifnot(identical(colnames(A_col), cell_names))     # Sanity check: column order should match cell_names
+neighbors_list <- vector("list", n_cells)
+probs_list     <- vector("list", n_cells)
+
+# dgCMatrix is column-compressed:
+#  - @p: pointers to start of each column (length ncol + 1)
+#  - @i: row indices (0-based)
+#  - @x: non-zero values
+for (j in seq_len(n_cells)) {
+  col_start <- A_col@p[j] + 1
+  col_end   <- A_col@p[j + 1]
+  
+  if (col_end >= col_start) {
+    rows <- A_col@i[col_start:col_end] + 1  # row indices (1-based)
+    w    <- A_col@x[col_start:col_end]      # edge weights
+    neighbors_list[[j]] <- rows
+    probs_list[[j]]     <- w / sum(w)
+  } else {
+    neighbors_list[[j]] <- integer(0)
+    probs_list[[j]]     <- numeric(0)
+  }
+}
+
+# Map cell name -> index
+cell_index <- seq_len(n_cells)
+names(cell_index) <- colnames(A_col)
+
+# Compute random-walk-based metrics for Informational Loss cells
+# Initialize result vectors
+HitRate       <- rep(NA_real_, n_cells)
+TopAnnotation <- rep(NA_character_, n_cells)
+
+names(HitRate)       <- cell_names
+names(TopAnnotation) <- cell_names
+
+loss_cells <- which(!is_labeled)     # Indices of Informational Loss cells
+
+# To record cells that never hit any labeled cell
+no_hit_cells <- character(0L)
+
+for (idx in loss_cells) {
+  start_name <- cell_names[idx]
+  
+  # Run random walks
+  hits <- character(n_walks)
+  for (w in seq_len(n_walks)) {
+    hits[w] <- random_walk_first_hit(
+      start_idx      = idx,
+      neighbors_list = neighbors_list,
+      probs_list     = probs_list,
+      is_labeled     = is_labeled,
+      label_vec      = label_vec,
+      T_max          = T_max
+    )
+  }
+  
+  # Separate hit vs no-hit
+  hit_labels <- hits[!is.na(hits)]
+  s <- length(hit_labels)     # total hits
+  r <- s / n_walks            # hit rate
+  
+  HitRate[idx] <- r
+  
+  if (s == 0L) {
+    # No hits: record NA and keep for alert
+    TopAnnotation[idx] <- NA_character_
+    no_hit_cells <- c(no_hit_cells, start_name)
+  } else {
+    # Empirical distribution over biological labels
+    tab <- table(hit_labels)
+    
+    # Most frequent InfoAnnotation
+    top_label <- names(tab)[which.max(tab)]
+    
+    TopAnnotation[idx] <- top_label
+  }
+}
+
+# For labeled cells, set to NA (RW-based metrics are defined only for loss cells)
+HitRate[is_labeled]       <- NA_real_
+TopAnnotation[is_labeled] <- NA_character_
+
+# Store into meta.data
+seu_all$RW_HitRate       <- HitRate
+seu_all$RW_TopAnnotation <- TopAnnotation
+
+# Reliability of Informational Loss cells on UMAP
+seu_loss <- subset(seu_all, subset = InfoAnnotation == "Low-information cells")
+df <- FetchData(seu_loss, vars = c("nCount_RNA", "RW_HitRate"))
+meta_loss <- seu_all@meta.data[!is_labeled, , drop = FALSE]
+
+# Subsampling comparison
+th_HitRate  <- quantile(meta_loss$RW_HitRate, probs = 50 / 100, na.rm = TRUE)
+good_loss_cells <- rownames(meta_loss)[meta_loss$RW_HitRate > th_HitRate]
+valid_cells <- colnames(seu_all)[is_labeled]
+cells_to_keep <- c(valid_cells, good_loss_cells)
+seurat_pbmc_filtered_II_rw <- subset(seu_all, cells = cells_to_keep)
+
+thr <- 0.05
+n_iter <- 100
+sample_n <- 1500
+
+seu_list <- list(
+  filtered_II       = seurat_pbmc_filtered_II,
+  filtered_II_rw    = seurat_pbmc_filtered_II_rw,
+  filtered_II_valid = seurat_pbmc_filtered_II_valid
+)
+
+
+betti_list <- vector("list", length(seu_list) * n_iter)
+idx <- 1L
+
+pb <- progress_bar$new(
+  format = "  [:bar] :percent  eta: :eta  elapsed: :elapsed  :message",
+  total = length(seu_list) * n_iter,
+  clear = FALSE,
+  width = 80
+)
+
+for (sample_name in names(seu_list)) {
+  seu_src <- seu_list[[sample_name]]
+  
+  for (iter in seq_len(n_iter)) {
+    pb$tick(tokens = list(message = paste(sample_name, "iter", iter)))
+    
+    set.seed(42 + iter)
+    sampled_cells <- sample(colnames(seu_src), size = sample_n, replace = FALSE)
+    seu_sub <- subset(seu_src, cells = sampled_cells)
+    
+    num_neighbors <- floor(ncol(seu_sub) / 100)
+    
+    seu_sub <- NormalizeData(
+      seu_sub,
+      normalization.method = "LogNormalize",
+      scale.factor = 10000,
+      verbose = FALSE
+    )
+    seu_sub <- FindVariableFeatures(
+      seu_sub,
+      selection.method = "vst",
+      nfeatures = 2000,
+      verbose = FALSE
+    )
+    seu_sub <- ScaleData(seu_sub, verbose = FALSE)
+    seu_sub <- RunPCA(seu_sub, verbose = FALSE)
+    seu_sub <- FindNeighbors(
+      seu_sub,
+      dims = 1:30,
+      k.param = num_neighbors,
+      verbose = FALSE
+    )
+    seu_sub <- FindClusters(
+      seu_sub,
+      resolution = 1,
+      verbose = FALSE
+    )
+    
+    m_counts <- GetAssayData(seu_sub, assay = "RNA", layer = "counts")
+    m_data   <- GetAssayData(seu_sub, assay = "RNA", layer = "data")
+    
+    sce <- as.SingleCellExperiment(seu_sub, assay = "RNA")
+    SummarizedExperiment::assay(sce, "counts")    <- as(m_counts, "dgCMatrix")
+    SummarizedExperiment::assay(sce, "logcounts") <- as(m_data, "dgCMatrix")
+    
+    if ("pca" %in% Reductions(seu_sub)) {
+      SingleCellExperiment::reducedDim(sce, "X_pca") <- Embeddings(seu_sub, "pca")
+    }
+    
+    tmp_h5ad <- tempfile(fileext = ".h5ad")
+    zellkonverter::writeH5AD(sce, tmp_h5ad)
+    
+    adata <- sc$read_h5ad(tmp_h5ad)
+    unlink(tmp_h5ad)
+    
+    adata$obs["seurat_clusters"] <- adata$obs["seurat_clusters"]$astype("category")
+    
+    Xp <- adata$obsm$get("X_pca")
+    if (py_has_attr(Xp, "values")) {
+      Xp <- Xp$values
+    }
+    Xp <- np$ascontiguousarray(np$asarray(Xp, dtype = "float32"))
+    adata$obsm$`__setitem__`("X_pca", Xp)
+    
+    n_pcs_use <- as.integer(min(30L, ncol(Embeddings(seu_sub, "pca"))))
+    
+    sc$pp$neighbors(
+      adata,
+      use_rep = "X_pca",
+      n_neighbors = as.integer(num_neighbors),
+      n_pcs = n_pcs_use
+    )
+    sc$tl$paga(adata, groups = "seurat_clusters")
+    
+    paga_conn <- adata$uns[["paga"]][["connectivities"]]
+    paga_mat  <- py_to_r(paga_conn$toarray())
+    paga_mat[paga_mat < thr] <- 0
+    
+    g <- igraph::graph_from_adjacency_matrix(
+      paga_mat,
+      mode = "undirected",
+      weighted = TRUE,
+      diag = FALSE
+    )
+    g <- igraph::simplify(g, remove.multiple = TRUE, remove.loops = TRUE)
+    
+    comp  <- igraph::components(g)
+    beta0 <- comp$no
+    V     <- igraph::vcount(g)
+    E     <- igraph::ecount(g)
+    beta1 <- E - V + beta0
+    
+    betti_list[[idx]] <- data.frame(
+      sample = sample_name,
+      iter = iter,
+      n_cells = ncol(seu_sub),
+      num_neighbors = num_neighbors,
+      num_clusters = V,
+      beta0 = beta0,
+      beta1 = beta1,
+      stringsAsFactors = FALSE
+    )
+    
+    idx <- idx + 1L
+  }
+}
+
+betti_boot_df <- do.call(rbind, betti_list)
+rownames(betti_boot_df) <- NULL
+write.csv(betti_boot_df, file = "betti_df_T20.csv", row.names = FALSE)
+
+plot_df <- betti_boot_df
+plot_df$sample <- factor(
+  plot_df$sample,
+  levels = c("filtered_II", "filtered_II_rw", "filtered_II_valid")
+)
+
+p_beta1 <- ggplot(plot_df, aes(x = sample, y = beta1, fill = sample)) +
+  geom_boxplot(
+    width = 0.15,
+    outlier.shape = NA,
+    color = "black",
+    median.color = "red",
+    median.linewidth = 1.5
+  ) +
+  stat_boxplot(
+    geom = "errorbar",
+    width = 0.08,
+    color = "black"
+  ) +
+  scale_x_discrete(
+    breaks = c("filtered_II", "filtered_II_rw", "filtered_II_valid"),
+    labels = expression(
+      M,
+      M[50 * "%"],
+      M * "'"
+    )
+  ) +
+  scale_fill_manual(
+    values = c(
+      "filtered_II" = "steelblue",
+      "filtered_II_rw" = "gray",
+      "filtered_II_valid" = "darkorange"
+    )
+  ) +
+  coord_cartesian(ylim = c(0, 12)) +
+  labs(
+    x = NULL,
+    y = "First Betti number"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 0, hjust = 0.5)
+  )
+
+p_beta1
+ggsave("box_beta1_T20.png", p_beta1, width = 4.5, height = 4, dpi = 600)
+
+# the number of neighbors
+# neigh = 2%
+neigh <- 5
+num_neighbors <- floor(seu_all@assays$RNA@layers$counts@Dim[[2]] / (neigh * 10))
+seu_all <- FindNeighbors(seu_all, dims = 1:30, k.param = num_neighbors)
+seu_all <- FindClusters(seu_all, resolution = 1)
+seu_all <- RunUMAP(seu_all, dims = 1:30, n.neighbors = num_neighbors, metric = "euclidean")
+
+# Remove "back-doors"
+n_walks <- 1000        # number of random walks per cell (k)
+T_max   <- 5       # maximum steps per walk (T)
+info_loss_label <- "Low-information cells"
+info_annot <- seu_all$InfoAnnotation
+cell_names <- colnames(seu_all)
+is_labeled <- info_annot != info_loss_label
+label_vec  <- info_annot           # biological labels or "Low-information cells"
+bio_labels <- sort(unique(label_vec[is_labeled]))
+K <- length(bio_labels)
+
+# Extract SNN graph and construct transition probabilities
+graph_name <- grep("_snn$", names(seu_all@graphs), value = TRUE)[1]
+A <- seu_all@graphs[[graph_name]]  # dgCMatrix adjacency matrix
+diag(A) <- 0    # remove self-loop 
+A_col <- t(A) 
+n_cells <- ncol(A_col)
+stopifnot(identical(colnames(A_col), cell_names))     # Sanity check: column order should match cell_names
+neighbors_list <- vector("list", n_cells)
+probs_list     <- vector("list", n_cells)
+
+# dgCMatrix is column-compressed:
+#  - @p: pointers to start of each column (length ncol + 1)
+#  - @i: row indices (0-based)
+#  - @x: non-zero values
+for (j in seq_len(n_cells)) {
+  col_start <- A_col@p[j] + 1
+  col_end   <- A_col@p[j + 1]
+  
+  if (col_end >= col_start) {
+    rows <- A_col@i[col_start:col_end] + 1  # row indices (1-based)
+    w    <- A_col@x[col_start:col_end]      # edge weights
+    neighbors_list[[j]] <- rows
+    probs_list[[j]]     <- w / sum(w)
+  } else {
+    neighbors_list[[j]] <- integer(0)
+    probs_list[[j]]     <- numeric(0)
+  }
+}
+
+# Map cell name -> index
+cell_index <- seq_len(n_cells)
+names(cell_index) <- colnames(A_col)
+
+# Compute random-walk-based metrics for Informational Loss cells
+# Initialize result vectors
+HitRate       <- rep(NA_real_, n_cells)
+TopAnnotation <- rep(NA_character_, n_cells)
+
+names(HitRate)       <- cell_names
+names(TopAnnotation) <- cell_names
+
+loss_cells <- which(!is_labeled)     # Indices of Informational Loss cells
+
+# To record cells that never hit any labeled cell
+no_hit_cells <- character(0L)
+
+for (idx in loss_cells) {
+  start_name <- cell_names[idx]
+  
+  # Run random walks
+  hits <- character(n_walks)
+  for (w in seq_len(n_walks)) {
+    hits[w] <- random_walk_first_hit(
+      start_idx      = idx,
+      neighbors_list = neighbors_list,
+      probs_list     = probs_list,
+      is_labeled     = is_labeled,
+      label_vec      = label_vec,
+      T_max          = T_max
+    )
+  }
+  
+  # Separate hit vs no-hit
+  hit_labels <- hits[!is.na(hits)]
+  s <- length(hit_labels)     # total hits
+  r <- s / n_walks            # hit rate
+  
+  HitRate[idx] <- r
+  
+  if (s == 0L) {
+    # No hits: record NA and keep for alert
+    TopAnnotation[idx] <- NA_character_
+    no_hit_cells <- c(no_hit_cells, start_name)
+  } else {
+    # Empirical distribution over biological labels
+    tab <- table(hit_labels)
+    
+    # Most frequent InfoAnnotation
+    top_label <- names(tab)[which.max(tab)]
+    
+    TopAnnotation[idx] <- top_label
+  }
+}
+
+# For labeled cells, set to NA (RW-based metrics are defined only for loss cells)
+HitRate[is_labeled]       <- NA_real_
+TopAnnotation[is_labeled] <- NA_character_
+
+# Store into meta.data
+seu_all$RW_HitRate       <- HitRate
+seu_all$RW_TopAnnotation <- TopAnnotation
+
+# Reliability of Informational Loss cells on UMAP
+seu_loss <- subset(seu_all, subset = InfoAnnotation == "Low-information cells")
+df <- FetchData(seu_loss, vars = c("nCount_RNA", "RW_HitRate"))
+meta_loss <- seu_all@meta.data[!is_labeled, , drop = FALSE]
+meta_loss <- seu_all@meta.data[!is_labeled, , drop = FALSE]
+
+# Subsampling comparison
+th_HitRate  <- quantile(meta_loss$RW_HitRate, probs = 50 / 100, na.rm = TRUE)
+good_loss_cells <- rownames(meta_loss)[meta_loss$RW_HitRate > th_HitRate]
+valid_cells <- colnames(seu_all)[is_labeled]
+cells_to_keep <- c(valid_cells, good_loss_cells)
+seurat_pbmc_filtered_II_rw <- subset(seu_all, cells = cells_to_keep)
+
+thr <- 0.05
+n_iter <- 100
+sample_n <- 1500
+
+seu_list <- list(
+  filtered_II       = seurat_pbmc_filtered_II,
+  filtered_II_rw    = seurat_pbmc_filtered_II_rw,
+  filtered_II_valid = seurat_pbmc_filtered_II_valid
+)
+
+betti_list <- vector("list", length(seu_list) * n_iter)
+idx <- 1L
+
+pb <- progress_bar$new(
+  format = "  [:bar] :percent  eta: :eta  elapsed: :elapsed  :message",
+  total = length(seu_list) * n_iter,
+  clear = FALSE,
+  width = 80
+)
+
+for (sample_name in names(seu_list)) {
+  seu_src <- seu_list[[sample_name]]
+  
+  for (iter in seq_len(n_iter)) {
+    pb$tick(tokens = list(message = paste(sample_name, "iter", iter)))
+    
+    set.seed(42 + iter)
+    sampled_cells <- sample(colnames(seu_src), size = sample_n, replace = FALSE)
+    seu_sub <- subset(seu_src, cells = sampled_cells)
+    
+    num_neighbors <- floor(seu_sub@assays$RNA@layers$counts@Dim[[2]] / (neigh * 10))
+    
+    seu_sub <- NormalizeData(
+      seu_sub,
+      normalization.method = "LogNormalize",
+      scale.factor = 10000,
+      verbose = FALSE
+    )
+    seu_sub <- FindVariableFeatures(
+      seu_sub,
+      selection.method = "vst",
+      nfeatures = 2000,
+      verbose = FALSE
+    )
+    seu_sub <- ScaleData(seu_sub, verbose = FALSE)
+    seu_sub <- RunPCA(seu_sub, verbose = FALSE)
+    seu_sub <- FindNeighbors(
+      seu_sub,
+      dims = 1:30,
+      k.param = num_neighbors,
+      verbose = FALSE
+    )
+    seu_sub <- FindClusters(
+      seu_sub,
+      resolution = 1,
+      verbose = FALSE
+    )
+    
+    m_counts <- GetAssayData(seu_sub, assay = "RNA", layer = "counts")
+    m_data   <- GetAssayData(seu_sub, assay = "RNA", layer = "data")
+    
+    sce <- as.SingleCellExperiment(seu_sub, assay = "RNA")
+    SummarizedExperiment::assay(sce, "counts")    <- as(m_counts, "dgCMatrix")
+    SummarizedExperiment::assay(sce, "logcounts") <- as(m_data, "dgCMatrix")
+    
+    if ("pca" %in% Reductions(seu_sub)) {
+      SingleCellExperiment::reducedDim(sce, "X_pca") <- Embeddings(seu_sub, "pca")
+    }
+    
+    tmp_h5ad <- tempfile(fileext = ".h5ad")
+    zellkonverter::writeH5AD(sce, tmp_h5ad)
+    
+    adata <- sc$read_h5ad(tmp_h5ad)
+    unlink(tmp_h5ad)
+    
+    adata$obs["seurat_clusters"] <- adata$obs["seurat_clusters"]$astype("category")
+    
+    Xp <- adata$obsm$get("X_pca")
+    if (py_has_attr(Xp, "values")) {
+      Xp <- Xp$values
+    }
+    Xp <- np$ascontiguousarray(np$asarray(Xp, dtype = "float32"))
+    adata$obsm$`__setitem__`("X_pca", Xp)
+    
+    n_pcs_use <- as.integer(min(30L, ncol(Embeddings(seu_sub, "pca"))))
+    
+    sc$pp$neighbors(
+      adata,
+      use_rep = "X_pca",
+      n_neighbors = as.integer(num_neighbors),
+      n_pcs = n_pcs_use
+    )
+    sc$tl$paga(adata, groups = "seurat_clusters")
+    
+    paga_conn <- adata$uns[["paga"]][["connectivities"]]
+    paga_mat  <- py_to_r(paga_conn$toarray())
+    paga_mat[paga_mat < thr] <- 0
+    
+    g <- igraph::graph_from_adjacency_matrix(
+      paga_mat,
+      mode = "undirected",
+      weighted = TRUE,
+      diag = FALSE
+    )
+    g <- igraph::simplify(g, remove.multiple = TRUE, remove.loops = TRUE)
+    
+    comp  <- igraph::components(g)
+    beta0 <- comp$no
+    V     <- igraph::vcount(g)
+    E     <- igraph::ecount(g)
+    beta1 <- E - V + beta0
+    
+    betti_list[[idx]] <- data.frame(
+      sample = sample_name,
+      iter = iter,
+      n_cells = ncol(seu_sub),
+      num_neighbors = num_neighbors,
+      num_clusters = V,
+      beta0 = beta0,
+      beta1 = beta1,
+      stringsAsFactors = FALSE
+    )
+    
+    idx <- idx + 1L
+  }
+}
+
+betti_boot_df <- do.call(rbind, betti_list)
+rownames(betti_boot_df) <- NULL
+write.csv(betti_boot_df, file = "betti_df_neigh2_0.csv", row.names = FALSE)
+
+plot_df <- betti_boot_df
+plot_df$sample <- factor(
+  plot_df$sample,
+  levels = c("filtered_II", "filtered_II_rw", "filtered_II_valid")
+)
+
+p_beta1 <- ggplot(plot_df, aes(x = sample, y = beta1, fill = sample)) +
+  geom_boxplot(
+    width = 0.15,
+    outlier.shape = NA,
+    color = "black",
+    median.color = "red",
+    median.linewidth = 1.5
+  ) +
+  stat_boxplot(
+    geom = "errorbar",
+    width = 0.08,
+    color = "black"
+  ) +
+  scale_x_discrete(
+    breaks = c("filtered_II", "filtered_II_rw", "filtered_II_valid"),
+    labels = expression(
+      M,
+      M[50 * "%"],
+      M * "'"
+    )
+  ) +
+  scale_fill_manual(
+    values = c(
+      "filtered_II" = "steelblue",
+      "filtered_II_rw" = "gray",
+      "filtered_II_valid" = "darkorange"
+    )
+  ) +
+  coord_cartesian(ylim = c(0, 12)) +
+  labs(
+    x = NULL,
+    y = "First Betti number"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 0, hjust = 0.5)
+  )
+
+p_beta1
+ggsave("box_beta1_neigh2_0.png", p_beta1, width = 4.5, height = 4, dpi = 600)
+
+# the number of neighbors
+# neigh = 1.5%
+neigh <- 6.6667
+num_neighbors <- floor(seu_all@assays$RNA@layers$counts@Dim[[2]] / (neigh * 10))
+seu_all <- FindNeighbors(seu_all, dims = 1:30, k.param = num_neighbors)
+seu_all <- FindClusters(seu_all, resolution = 1)
+seu_all <- RunUMAP(seu_all, dims = 1:30, n.neighbors = num_neighbors, metric = "euclidean")
+
+# Remove "back-doors"
+n_walks <- 1000        # number of random walks per cell (k)
+T_max   <- 5       # maximum steps per walk (T)
+info_loss_label <- "Low-information cells"
+info_annot <- seu_all$InfoAnnotation
+cell_names <- colnames(seu_all)
+is_labeled <- info_annot != info_loss_label
+label_vec  <- info_annot           # biological labels or "Low-information cells"
+bio_labels <- sort(unique(label_vec[is_labeled]))
+K <- length(bio_labels)
+
+# Extract SNN graph and construct transition probabilities
+graph_name <- grep("_snn$", names(seu_all@graphs), value = TRUE)[1]
+A <- seu_all@graphs[[graph_name]]  # dgCMatrix adjacency matrix
+diag(A) <- 0    # remove self-loop 
+A_col <- t(A) 
+n_cells <- ncol(A_col)
+stopifnot(identical(colnames(A_col), cell_names))     # Sanity check: column order should match cell_names
+neighbors_list <- vector("list", n_cells)
+probs_list     <- vector("list", n_cells)
+
+# dgCMatrix is column-compressed:
+#  - @p: pointers to start of each column (length ncol + 1)
+#  - @i: row indices (0-based)
+#  - @x: non-zero values
+for (j in seq_len(n_cells)) {
+  col_start <- A_col@p[j] + 1
+  col_end   <- A_col@p[j + 1]
+  
+  if (col_end >= col_start) {
+    rows <- A_col@i[col_start:col_end] + 1  # row indices (1-based)
+    w    <- A_col@x[col_start:col_end]      # edge weights
+    neighbors_list[[j]] <- rows
+    probs_list[[j]]     <- w / sum(w)
+  } else {
+    neighbors_list[[j]] <- integer(0)
+    probs_list[[j]]     <- numeric(0)
+  }
+}
+
+# Map cell name -> index
+cell_index <- seq_len(n_cells)
+names(cell_index) <- colnames(A_col)
+
+# Compute random-walk-based metrics for Informational Loss cells
+# Initialize result vectors
+HitRate       <- rep(NA_real_, n_cells)
+TopAnnotation <- rep(NA_character_, n_cells)
+
+names(HitRate)       <- cell_names
+names(TopAnnotation) <- cell_names
+
+loss_cells <- which(!is_labeled)     # Indices of Informational Loss cells
+
+# To record cells that never hit any labeled cell
+no_hit_cells <- character(0L)
+
+for (idx in loss_cells) {
+  start_name <- cell_names[idx]
+  
+  # Run random walks
+  hits <- character(n_walks)
+  for (w in seq_len(n_walks)) {
+    hits[w] <- random_walk_first_hit(
+      start_idx      = idx,
+      neighbors_list = neighbors_list,
+      probs_list     = probs_list,
+      is_labeled     = is_labeled,
+      label_vec      = label_vec,
+      T_max          = T_max
+    )
+  }
+  
+  # Separate hit vs no-hit
+  hit_labels <- hits[!is.na(hits)]
+  s <- length(hit_labels)     # total hits
+  r <- s / n_walks            # hit rate
+  
+  HitRate[idx] <- r
+  
+  if (s == 0L) {
+    # No hits: record NA and keep for alert
+    TopAnnotation[idx] <- NA_character_
+    no_hit_cells <- c(no_hit_cells, start_name)
+  } else {
+    # Empirical distribution over biological labels
+    tab <- table(hit_labels)
+    
+    # Most frequent InfoAnnotation
+    top_label <- names(tab)[which.max(tab)]
+    
+    TopAnnotation[idx] <- top_label
+  }
+}
+
+# For labeled cells, set to NA (RW-based metrics are defined only for loss cells)
+HitRate[is_labeled]       <- NA_real_
+TopAnnotation[is_labeled] <- NA_character_
+
+# Store into meta.data
+seu_all$RW_HitRate       <- HitRate
+seu_all$RW_TopAnnotation <- TopAnnotation
+
+# Reliability of Informational Loss cells on UMAP
+seu_loss <- subset(seu_all, subset = InfoAnnotation == "Low-information cells")
+df <- FetchData(seu_loss, vars = c("nCount_RNA", "RW_HitRate"))
+meta_loss <- seu_all@meta.data[!is_labeled, , drop = FALSE]
+meta_loss <- seu_all@meta.data[!is_labeled, , drop = FALSE]
+
+# Subsampling comparison
+th_HitRate  <- quantile(meta_loss$RW_HitRate, probs = 50 / 100, na.rm = TRUE)
+good_loss_cells <- rownames(meta_loss)[meta_loss$RW_HitRate > th_HitRate]
+valid_cells <- colnames(seu_all)[is_labeled]
+cells_to_keep <- c(valid_cells, good_loss_cells)
+seurat_pbmc_filtered_II_rw <- subset(seu_all, cells = cells_to_keep)
+
+thr <- 0.05
+n_iter <- 100
+sample_n <- 1500
+
+seu_list <- list(
+  filtered_II       = seurat_pbmc_filtered_II,
+  filtered_II_rw    = seurat_pbmc_filtered_II_rw,
+  filtered_II_valid = seurat_pbmc_filtered_II_valid
+)
+
+betti_list <- vector("list", length(seu_list) * n_iter)
+idx <- 1L
+
+pb <- progress_bar$new(
+  format = "  [:bar] :percent  eta: :eta  elapsed: :elapsed  :message",
+  total = length(seu_list) * n_iter,
+  clear = FALSE,
+  width = 80
+)
+
+for (sample_name in names(seu_list)) {
+  seu_src <- seu_list[[sample_name]]
+  
+  for (iter in seq_len(n_iter)) {
+    pb$tick(tokens = list(message = paste(sample_name, "iter", iter)))
+    
+    set.seed(42 + iter)
+    sampled_cells <- sample(colnames(seu_src), size = sample_n, replace = FALSE)
+    seu_sub <- subset(seu_src, cells = sampled_cells)
+    
+    num_neighbors <- floor(seu_sub@assays$RNA@layers$counts@Dim[[2]] / (neigh * 10))
+    
+    seu_sub <- NormalizeData(
+      seu_sub,
+      normalization.method = "LogNormalize",
+      scale.factor = 10000,
+      verbose = FALSE
+    )
+    seu_sub <- FindVariableFeatures(
+      seu_sub,
+      selection.method = "vst",
+      nfeatures = 2000,
+      verbose = FALSE
+    )
+    seu_sub <- ScaleData(seu_sub, verbose = FALSE)
+    seu_sub <- RunPCA(seu_sub, verbose = FALSE)
+    seu_sub <- FindNeighbors(
+      seu_sub,
+      dims = 1:30,
+      k.param = num_neighbors,
+      verbose = FALSE
+    )
+    seu_sub <- FindClusters(
+      seu_sub,
+      resolution = 1,
+      verbose = FALSE
+    )
+    
+    m_counts <- GetAssayData(seu_sub, assay = "RNA", layer = "counts")
+    m_data   <- GetAssayData(seu_sub, assay = "RNA", layer = "data")
+    
+    sce <- as.SingleCellExperiment(seu_sub, assay = "RNA")
+    SummarizedExperiment::assay(sce, "counts")    <- as(m_counts, "dgCMatrix")
+    SummarizedExperiment::assay(sce, "logcounts") <- as(m_data, "dgCMatrix")
+    
+    if ("pca" %in% Reductions(seu_sub)) {
+      SingleCellExperiment::reducedDim(sce, "X_pca") <- Embeddings(seu_sub, "pca")
+    }
+    
+    tmp_h5ad <- tempfile(fileext = ".h5ad")
+    zellkonverter::writeH5AD(sce, tmp_h5ad)
+    
+    adata <- sc$read_h5ad(tmp_h5ad)
+    unlink(tmp_h5ad)
+    
+    adata$obs["seurat_clusters"] <- adata$obs["seurat_clusters"]$astype("category")
+    
+    Xp <- adata$obsm$get("X_pca")
+    if (py_has_attr(Xp, "values")) {
+      Xp <- Xp$values
+    }
+    Xp <- np$ascontiguousarray(np$asarray(Xp, dtype = "float32"))
+    adata$obsm$`__setitem__`("X_pca", Xp)
+    
+    n_pcs_use <- as.integer(min(30L, ncol(Embeddings(seu_sub, "pca"))))
+    
+    sc$pp$neighbors(
+      adata,
+      use_rep = "X_pca",
+      n_neighbors = as.integer(num_neighbors),
+      n_pcs = n_pcs_use
+    )
+    sc$tl$paga(adata, groups = "seurat_clusters")
+    
+    paga_conn <- adata$uns[["paga"]][["connectivities"]]
+    paga_mat  <- py_to_r(paga_conn$toarray())
+    paga_mat[paga_mat < thr] <- 0
+    
+    g <- igraph::graph_from_adjacency_matrix(
+      paga_mat,
+      mode = "undirected",
+      weighted = TRUE,
+      diag = FALSE
+    )
+    g <- igraph::simplify(g, remove.multiple = TRUE, remove.loops = TRUE)
+    
+    comp  <- igraph::components(g)
+    beta0 <- comp$no
+    V     <- igraph::vcount(g)
+    E     <- igraph::ecount(g)
+    beta1 <- E - V + beta0
+    
+    betti_list[[idx]] <- data.frame(
+      sample = sample_name,
+      iter = iter,
+      n_cells = ncol(seu_sub),
+      num_neighbors = num_neighbors,
+      num_clusters = V,
+      beta0 = beta0,
+      beta1 = beta1,
+      stringsAsFactors = FALSE
+    )
+    
+    idx <- idx + 1L
+  }
+}
+
+betti_boot_df <- do.call(rbind, betti_list)
+rownames(betti_boot_df) <- NULL
+write.csv(betti_boot_df, file = "betti_df_neigh1_5.csv", row.names = FALSE)
+
+plot_df <- betti_boot_df
+plot_df$sample <- factor(
+  plot_df$sample,
+  levels = c("filtered_II", "filtered_II_rw", "filtered_II_valid")
+)
+
+p_beta1 <- ggplot(plot_df, aes(x = sample, y = beta1, fill = sample)) +
+  geom_boxplot(
+    width = 0.15,
+    outlier.shape = NA,
+    color = "black",
+    median.color = "red",
+    median.linewidth = 1.5
+  ) +
+  stat_boxplot(
+    geom = "errorbar",
+    width = 0.08,
+    color = "black"
+  ) +
+  scale_x_discrete(
+    breaks = c("filtered_II", "filtered_II_rw", "filtered_II_valid"),
+    labels = expression(
+      M,
+      M[50 * "%"],
+      M * "'"
+    )
+  ) +
+  scale_fill_manual(
+    values = c(
+      "filtered_II" = "steelblue",
+      "filtered_II_rw" = "gray",
+      "filtered_II_valid" = "darkorange"
+    )
+  ) +
+  coord_cartesian(ylim = c(0, 12)) +
+  labs(
+    x = NULL,
+    y = "First Betti number"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 0, hjust = 0.5)
+  )
+
+p_beta1
+ggsave("box_beta1_neigh1_5.png", p_beta1, width = 4.5, height = 4, dpi = 600)
+
+# Louvain resolution
+# res = 1.2
+res <- 1.2
+num_neighbors <- floor(seu_all@assays$RNA@layers$counts@Dim[[2]] / 100)
+seu_all <- FindNeighbors(seu_all, dims = 1:30, k.param = num_neighbors)
+seu_all <- FindClusters(seu_all, resolution = res)
+seu_all <- RunUMAP(seu_all, dims = 1:30, n.neighbors = num_neighbors, metric = "euclidean")
+
+# Remove "back-doors"
+n_walks <- 1000        # number of random walks per cell (k)
+T_max   <- 5       # maximum steps per walk (T)
+info_loss_label <- "Low-information cells"
+info_annot <- seu_all$InfoAnnotation
+cell_names <- colnames(seu_all)
+is_labeled <- info_annot != info_loss_label
+label_vec  <- info_annot           # biological labels or "Low-information cells"
+bio_labels <- sort(unique(label_vec[is_labeled]))
+K <- length(bio_labels)
+
+# Extract SNN graph and construct transition probabilities
+graph_name <- grep("_snn$", names(seu_all@graphs), value = TRUE)[1]
+A <- seu_all@graphs[[graph_name]]  # dgCMatrix adjacency matrix
+diag(A) <- 0    # remove self-loop 
+A_col <- t(A) 
+n_cells <- ncol(A_col)
+stopifnot(identical(colnames(A_col), cell_names))     # Sanity check: column order should match cell_names
+neighbors_list <- vector("list", n_cells)
+probs_list     <- vector("list", n_cells)
+
+# dgCMatrix is column-compressed:
+#  - @p: pointers to start of each column (length ncol + 1)
+#  - @i: row indices (0-based)
+#  - @x: non-zero values
+for (j in seq_len(n_cells)) {
+  col_start <- A_col@p[j] + 1
+  col_end   <- A_col@p[j + 1]
+  
+  if (col_end >= col_start) {
+    rows <- A_col@i[col_start:col_end] + 1  # row indices (1-based)
+    w    <- A_col@x[col_start:col_end]      # edge weights
+    neighbors_list[[j]] <- rows
+    probs_list[[j]]     <- w / sum(w)
+  } else {
+    neighbors_list[[j]] <- integer(0)
+    probs_list[[j]]     <- numeric(0)
+  }
+}
+
+# Map cell name -> index
+cell_index <- seq_len(n_cells)
+names(cell_index) <- colnames(A_col)
+
+# Compute random-walk-based metrics for Informational Loss cells
+# Initialize result vectors
+HitRate       <- rep(NA_real_, n_cells)
+TopAnnotation <- rep(NA_character_, n_cells)
+
+names(HitRate)       <- cell_names
+names(TopAnnotation) <- cell_names
+
+loss_cells <- which(!is_labeled)     # Indices of Informational Loss cells
+
+# To record cells that never hit any labeled cell
+no_hit_cells <- character(0L)
+
+for (idx in loss_cells) {
+  start_name <- cell_names[idx]
+  
+  # Run random walks
+  hits <- character(n_walks)
+  for (w in seq_len(n_walks)) {
+    hits[w] <- random_walk_first_hit(
+      start_idx      = idx,
+      neighbors_list = neighbors_list,
+      probs_list     = probs_list,
+      is_labeled     = is_labeled,
+      label_vec      = label_vec,
+      T_max          = T_max
+    )
+  }
+  
+  # Separate hit vs no-hit
+  hit_labels <- hits[!is.na(hits)]
+  s <- length(hit_labels)     # total hits
+  r <- s / n_walks            # hit rate
+  
+  HitRate[idx] <- r
+  
+  if (s == 0L) {
+    # No hits: record NA and keep for alert
+    TopAnnotation[idx] <- NA_character_
+    no_hit_cells <- c(no_hit_cells, start_name)
+  } else {
+    # Empirical distribution over biological labels
+    tab <- table(hit_labels)
+    
+    # Most frequent InfoAnnotation
+    top_label <- names(tab)[which.max(tab)]
+    
+    TopAnnotation[idx] <- top_label
+  }
+}
+
+# For labeled cells, set to NA (RW-based metrics are defined only for loss cells)
+HitRate[is_labeled]       <- NA_real_
+TopAnnotation[is_labeled] <- NA_character_
+
+# Store into meta.data
+seu_all$RW_HitRate       <- HitRate
+seu_all$RW_TopAnnotation <- TopAnnotation
+
+# Reliability of Informational Loss cells on UMAP
+seu_loss <- subset(seu_all, subset = InfoAnnotation == "Low-information cells")
+df <- FetchData(seu_loss, vars = c("nCount_RNA", "RW_HitRate"))
+meta_loss <- seu_all@meta.data[!is_labeled, , drop = FALSE]
+
+# Subsampling comparison
+th_HitRate  <- quantile(meta_loss$RW_HitRate, probs = 50 / 100, na.rm = TRUE)
+good_loss_cells <- rownames(meta_loss)[meta_loss$RW_HitRate > th_HitRate]
+valid_cells <- colnames(seu_all)[is_labeled]
+cells_to_keep <- c(valid_cells, good_loss_cells)
+seurat_pbmc_filtered_II_rw <- subset(seu_all, cells = cells_to_keep)
+
+thr <- 0.05
+n_iter <- 100
+sample_n <- 1500
+
+seu_list <- list(
+  filtered_II       = seurat_pbmc_filtered_II,
+  filtered_II_rw    = seurat_pbmc_filtered_II_rw,
+  filtered_II_valid = seurat_pbmc_filtered_II_valid
+)
+
+betti_list <- vector("list", length(seu_list) * n_iter)
+idx <- 1L
+
+pb <- progress_bar$new(
+  format = "  [:bar] :percent  eta: :eta  elapsed: :elapsed  :message",
+  total = length(seu_list) * n_iter,
+  clear = FALSE,
+  width = 80
+)
+
+for (sample_name in names(seu_list)) {
+  seu_src <- seu_list[[sample_name]]
+  
+  for (iter in seq_len(n_iter)) {
+    pb$tick(tokens = list(message = paste(sample_name, "iter", iter)))
+    
+    set.seed(42 + iter)
+    sampled_cells <- sample(colnames(seu_src), size = sample_n, replace = FALSE)
+    seu_sub <- subset(seu_src, cells = sampled_cells)
+    
+    num_neighbors <- floor(ncol(seu_sub) / 100)
+    
+    seu_sub <- NormalizeData(
+      seu_sub,
+      normalization.method = "LogNormalize",
+      scale.factor = 10000,
+      verbose = FALSE
+    )
+    seu_sub <- FindVariableFeatures(
+      seu_sub,
+      selection.method = "vst",
+      nfeatures = 2000,
+      verbose = FALSE
+    )
+    seu_sub <- ScaleData(seu_sub, verbose = FALSE)
+    seu_sub <- RunPCA(seu_sub, verbose = FALSE)
+    seu_sub <- FindNeighbors(
+      seu_sub,
+      dims = 1:30,
+      k.param = num_neighbors,
+      verbose = FALSE
+    )
+    seu_sub <- FindClusters(
+      seu_sub,
+      resolution = res,
+      verbose = FALSE
+    )
+    
+    m_counts <- GetAssayData(seu_sub, assay = "RNA", layer = "counts")
+    m_data   <- GetAssayData(seu_sub, assay = "RNA", layer = "data")
+    
+    sce <- as.SingleCellExperiment(seu_sub, assay = "RNA")
+    SummarizedExperiment::assay(sce, "counts")    <- as(m_counts, "dgCMatrix")
+    SummarizedExperiment::assay(sce, "logcounts") <- as(m_data, "dgCMatrix")
+    
+    if ("pca" %in% Reductions(seu_sub)) {
+      SingleCellExperiment::reducedDim(sce, "X_pca") <- Embeddings(seu_sub, "pca")
+    }
+    
+    tmp_h5ad <- tempfile(fileext = ".h5ad")
+    zellkonverter::writeH5AD(sce, tmp_h5ad)
+    
+    adata <- sc$read_h5ad(tmp_h5ad)
+    unlink(tmp_h5ad)
+    
+    adata$obs["seurat_clusters"] <- adata$obs["seurat_clusters"]$astype("category")
+    
+    Xp <- adata$obsm$get("X_pca")
+    if (py_has_attr(Xp, "values")) {
+      Xp <- Xp$values
+    }
+    Xp <- np$ascontiguousarray(np$asarray(Xp, dtype = "float32"))
+    adata$obsm$`__setitem__`("X_pca", Xp)
+    
+    n_pcs_use <- as.integer(min(30L, ncol(Embeddings(seu_sub, "pca"))))
+    
+    sc$pp$neighbors(
+      adata,
+      use_rep = "X_pca",
+      n_neighbors = as.integer(num_neighbors),
+      n_pcs = n_pcs_use
+    )
+    sc$tl$paga(adata, groups = "seurat_clusters")
+    
+    paga_conn <- adata$uns[["paga"]][["connectivities"]]
+    paga_mat  <- py_to_r(paga_conn$toarray())
+    paga_mat[paga_mat < thr] <- 0
+    
+    g <- igraph::graph_from_adjacency_matrix(
+      paga_mat,
+      mode = "undirected",
+      weighted = TRUE,
+      diag = FALSE
+    )
+    g <- igraph::simplify(g, remove.multiple = TRUE, remove.loops = TRUE)
+    
+    comp  <- igraph::components(g)
+    beta0 <- comp$no
+    V     <- igraph::vcount(g)
+    E     <- igraph::ecount(g)
+    beta1 <- E - V + beta0
+    
+    betti_list[[idx]] <- data.frame(
+      sample = sample_name,
+      iter = iter,
+      n_cells = ncol(seu_sub),
+      num_neighbors = num_neighbors,
+      num_clusters = V,
+      beta0 = beta0,
+      beta1 = beta1,
+      stringsAsFactors = FALSE
+    )
+    
+    idx <- idx + 1L
+  }
+}
+
+betti_boot_df <- do.call(rbind, betti_list)
+rownames(betti_boot_df) <- NULL
+write.csv(betti_boot_df, file = "betti_df_res1_2.csv", row.names = FALSE)
+
+plot_df <- betti_boot_df
+plot_df$sample <- factor(
+  plot_df$sample,
+  levels = c("filtered_II", "filtered_II_rw", "filtered_II_valid")
+)
+
+p_beta1 <- ggplot(plot_df, aes(x = sample, y = beta1, fill = sample)) +
+  geom_boxplot(
+    width = 0.15,
+    outlier.shape = NA,
+    color = "black",
+    median.color = "red",
+    median.linewidth = 1.5
+  ) +
+  stat_boxplot(
+    geom = "errorbar",
+    width = 0.08,
+    color = "black"
+  ) +
+  scale_x_discrete(
+    breaks = c("filtered_II", "filtered_II_rw", "filtered_II_valid"),
+    labels = expression(
+      M,
+      M[50 * "%"],
+      M * "'"
+    )
+  ) +
+  scale_fill_manual(
+    values = c(
+      "filtered_II" = "steelblue",
+      "filtered_II_rw" = "gray",
+      "filtered_II_valid" = "darkorange"
+    )
+  ) +
+  coord_cartesian(ylim = c(0, 25)) +
+  labs(
+    x = NULL,
+    y = "First Betti number"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 0, hjust = 0.5)
+  )
+
+p_beta1
+ggsave("box_beta1_res1_2.png", p_beta1, width = 4.5, height = 4, dpi = 600)
+
+# Louvain resolution
+# res = 1.5
+res <- 1.5
+num_neighbors <- floor(seu_all@assays$RNA@layers$counts@Dim[[2]] / 100)
+seu_all <- FindNeighbors(seu_all, dims = 1:30, k.param = num_neighbors)
+seu_all <- FindClusters(seu_all, resolution = res)
+seu_all <- RunUMAP(seu_all, dims = 1:30, n.neighbors = num_neighbors, metric = "euclidean")
+
+# Remove "back-doors"
+n_walks <- 1000        # number of random walks per cell (k)
+T_max   <- 5       # maximum steps per walk (T)
+info_loss_label <- "Low-information cells"
+info_annot <- seu_all$InfoAnnotation
+cell_names <- colnames(seu_all)
+is_labeled <- info_annot != info_loss_label
+label_vec  <- info_annot           # biological labels or "Low-information cells"
+bio_labels <- sort(unique(label_vec[is_labeled]))
+K <- length(bio_labels)
+
+# Extract SNN graph and construct transition probabilities
+graph_name <- grep("_snn$", names(seu_all@graphs), value = TRUE)[1]
+A <- seu_all@graphs[[graph_name]]  # dgCMatrix adjacency matrix
+diag(A) <- 0    # remove self-loop 
+A_col <- t(A) 
+n_cells <- ncol(A_col)
+stopifnot(identical(colnames(A_col), cell_names))     # Sanity check: column order should match cell_names
+neighbors_list <- vector("list", n_cells)
+probs_list     <- vector("list", n_cells)
+
+# dgCMatrix is column-compressed:
+#  - @p: pointers to start of each column (length ncol + 1)
+#  - @i: row indices (0-based)
+#  - @x: non-zero values
+for (j in seq_len(n_cells)) {
+  col_start <- A_col@p[j] + 1
+  col_end   <- A_col@p[j + 1]
+  
+  if (col_end >= col_start) {
+    rows <- A_col@i[col_start:col_end] + 1  # row indices (1-based)
+    w    <- A_col@x[col_start:col_end]      # edge weights
+    neighbors_list[[j]] <- rows
+    probs_list[[j]]     <- w / sum(w)
+  } else {
+    neighbors_list[[j]] <- integer(0)
+    probs_list[[j]]     <- numeric(0)
+  }
+}
+
+# Map cell name -> index
+cell_index <- seq_len(n_cells)
+names(cell_index) <- colnames(A_col)
+
+# Compute random-walk-based metrics for Informational Loss cells
+# Initialize result vectors
+HitRate       <- rep(NA_real_, n_cells)
+TopAnnotation <- rep(NA_character_, n_cells)
+
+names(HitRate)       <- cell_names
+names(TopAnnotation) <- cell_names
+
+loss_cells <- which(!is_labeled)     # Indices of Informational Loss cells
+
+# To record cells that never hit any labeled cell
+no_hit_cells <- character(0L)
+
+for (idx in loss_cells) {
+  start_name <- cell_names[idx]
+  
+  # Run random walks
+  hits <- character(n_walks)
+  for (w in seq_len(n_walks)) {
+    hits[w] <- random_walk_first_hit(
+      start_idx      = idx,
+      neighbors_list = neighbors_list,
+      probs_list     = probs_list,
+      is_labeled     = is_labeled,
+      label_vec      = label_vec,
+      T_max          = T_max
+    )
+  }
+  
+  # Separate hit vs no-hit
+  hit_labels <- hits[!is.na(hits)]
+  s <- length(hit_labels)     # total hits
+  r <- s / n_walks            # hit rate
+  
+  HitRate[idx] <- r
+  
+  if (s == 0L) {
+    # No hits: record NA and keep for alert
+    TopAnnotation[idx] <- NA_character_
+    no_hit_cells <- c(no_hit_cells, start_name)
+  } else {
+    # Empirical distribution over biological labels
+    tab <- table(hit_labels)
+    
+    # Most frequent InfoAnnotation
+    top_label <- names(tab)[which.max(tab)]
+    
+    TopAnnotation[idx] <- top_label
+  }
+}
+
+# For labeled cells, set to NA (RW-based metrics are defined only for loss cells)
+HitRate[is_labeled]       <- NA_real_
+TopAnnotation[is_labeled] <- NA_character_
+
+# Store into meta.data
+seu_all$RW_HitRate       <- HitRate
+seu_all$RW_TopAnnotation <- TopAnnotation
+
+# Reliability of Informational Loss cells on UMAP
+seu_loss <- subset(seu_all, subset = InfoAnnotation == "Low-information cells")
+df <- FetchData(seu_loss, vars = c("nCount_RNA", "RW_HitRate"))
+meta_loss <- seu_all@meta.data[!is_labeled, , drop = FALSE]
+
+# Subsampling comparison
+th_HitRate  <- quantile(meta_loss$RW_HitRate, probs = 50 / 100, na.rm = TRUE)
+good_loss_cells <- rownames(meta_loss)[meta_loss$RW_HitRate > th_HitRate]
+valid_cells <- colnames(seu_all)[is_labeled]
+cells_to_keep <- c(valid_cells, good_loss_cells)
+seurat_pbmc_filtered_II_rw <- subset(seu_all, cells = cells_to_keep)
+
+thr <- 0.05
+n_iter <- 100
+sample_n <- 1500
+
+seu_list <- list(
+  filtered_II       = seurat_pbmc_filtered_II,
+  filtered_II_rw    = seurat_pbmc_filtered_II_rw,
+  filtered_II_valid = seurat_pbmc_filtered_II_valid
+)
+
+betti_list <- vector("list", length(seu_list) * n_iter)
+idx <- 1L
+
+pb <- progress_bar$new(
+  format = "  [:bar] :percent  eta: :eta  elapsed: :elapsed  :message",
+  total = length(seu_list) * n_iter,
+  clear = FALSE,
+  width = 80
+)
+
+for (sample_name in names(seu_list)) {
+  seu_src <- seu_list[[sample_name]]
+  
+  for (iter in seq_len(n_iter)) {
+    pb$tick(tokens = list(message = paste(sample_name, "iter", iter)))
+    
+    set.seed(42 + iter)
+    sampled_cells <- sample(colnames(seu_src), size = sample_n, replace = FALSE)
+    seu_sub <- subset(seu_src, cells = sampled_cells)
+    
+    num_neighbors <- floor(ncol(seu_sub) / 100)
+    
+    seu_sub <- NormalizeData(
+      seu_sub,
+      normalization.method = "LogNormalize",
+      scale.factor = 10000,
+      verbose = FALSE
+    )
+    seu_sub <- FindVariableFeatures(
+      seu_sub,
+      selection.method = "vst",
+      nfeatures = 2000,
+      verbose = FALSE
+    )
+    seu_sub <- ScaleData(seu_sub, verbose = FALSE)
+    seu_sub <- RunPCA(seu_sub, verbose = FALSE)
+    seu_sub <- FindNeighbors(
+      seu_sub,
+      dims = 1:30,
+      k.param = num_neighbors,
+      verbose = FALSE
+    )
+    seu_sub <- FindClusters(
+      seu_sub,
+      resolution = res,
+      verbose = FALSE
+    )
+    
+    m_counts <- GetAssayData(seu_sub, assay = "RNA", layer = "counts")
+    m_data   <- GetAssayData(seu_sub, assay = "RNA", layer = "data")
+    
+    sce <- as.SingleCellExperiment(seu_sub, assay = "RNA")
+    SummarizedExperiment::assay(sce, "counts")    <- as(m_counts, "dgCMatrix")
+    SummarizedExperiment::assay(sce, "logcounts") <- as(m_data, "dgCMatrix")
+    
+    if ("pca" %in% Reductions(seu_sub)) {
+      SingleCellExperiment::reducedDim(sce, "X_pca") <- Embeddings(seu_sub, "pca")
+    }
+    
+    tmp_h5ad <- tempfile(fileext = ".h5ad")
+    zellkonverter::writeH5AD(sce, tmp_h5ad)
+    
+    adata <- sc$read_h5ad(tmp_h5ad)
+    unlink(tmp_h5ad)
+    
+    adata$obs["seurat_clusters"] <- adata$obs["seurat_clusters"]$astype("category")
+    
+    Xp <- adata$obsm$get("X_pca")
+    if (py_has_attr(Xp, "values")) {
+      Xp <- Xp$values
+    }
+    Xp <- np$ascontiguousarray(np$asarray(Xp, dtype = "float32"))
+    adata$obsm$`__setitem__`("X_pca", Xp)
+    
+    n_pcs_use <- as.integer(min(30L, ncol(Embeddings(seu_sub, "pca"))))
+    
+    sc$pp$neighbors(
+      adata,
+      use_rep = "X_pca",
+      n_neighbors = as.integer(num_neighbors),
+      n_pcs = n_pcs_use
+    )
+    sc$tl$paga(adata, groups = "seurat_clusters")
+    
+    paga_conn <- adata$uns[["paga"]][["connectivities"]]
+    paga_mat  <- py_to_r(paga_conn$toarray())
+    paga_mat[paga_mat < thr] <- 0
+    
+    g <- igraph::graph_from_adjacency_matrix(
+      paga_mat,
+      mode = "undirected",
+      weighted = TRUE,
+      diag = FALSE
+    )
+    g <- igraph::simplify(g, remove.multiple = TRUE, remove.loops = TRUE)
+    
+    comp  <- igraph::components(g)
+    beta0 <- comp$no
+    V     <- igraph::vcount(g)
+    E     <- igraph::ecount(g)
+    beta1 <- E - V + beta0
+    
+    betti_list[[idx]] <- data.frame(
+      sample = sample_name,
+      iter = iter,
+      n_cells = ncol(seu_sub),
+      num_neighbors = num_neighbors,
+      num_clusters = V,
+      beta0 = beta0,
+      beta1 = beta1,
+      stringsAsFactors = FALSE
+    )
+    
+    idx <- idx + 1L
+  }
+}
+
+betti_boot_df <- do.call(rbind, betti_list)
+rownames(betti_boot_df) <- NULL
+write.csv(betti_boot_df, file = "betti_df_res1_5.csv", row.names = FALSE)
+
+plot_df <- betti_boot_df
+plot_df$sample <- factor(
+  plot_df$sample,
+  levels = c("filtered_II", "filtered_II_rw", "filtered_II_valid")
+)
+
+p_beta1 <- ggplot(plot_df, aes(x = sample, y = beta1, fill = sample)) +
+  geom_boxplot(
+    width = 0.15,
+    outlier.shape = NA,
+    color = "black",
+    median.color = "red",
+    median.linewidth = 1.5
+  ) +
+  stat_boxplot(
+    geom = "errorbar",
+    width = 0.08,
+    color = "black"
+  ) +
+  scale_x_discrete(
+    breaks = c("filtered_II", "filtered_II_rw", "filtered_II_valid"),
+    labels = expression(
+      M,
+      M[50 * "%"],
+      M * "'"
+    )
+  ) +
+  scale_fill_manual(
+    values = c(
+      "filtered_II" = "steelblue",
+      "filtered_II_rw" = "gray",
+      "filtered_II_valid" = "darkorange"
+    )
+  ) +
+  coord_cartesian(ylim = c(0, 25)) +
+  labs(
+    x = NULL,
+    y = "First Betti number"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 0, hjust = 0.5)
+  )
+
+p_beta1
+ggsave("box_beta1_res1_5.png", p_beta1, width = 4.5, height = 4, dpi = 600)
+
+# RW vs total UMI
+n_walks <- 1000        # number of random walks per cell (k)
+T_max   <- 5       # maximum steps per walk (T)
+info_loss_label <- "Low-information cells"
+info_annot <- seu_all$InfoAnnotation
+cell_names <- colnames(seu_all)
+is_labeled <- info_annot != info_loss_label
+label_vec  <- info_annot           # biological labels or "Low-information cells"
+bio_labels <- sort(unique(label_vec[is_labeled]))
+K <- length(bio_labels)
+
+# Extract SNN graph and construct transition probabilities
+graph_name <- grep("_snn$", names(seu_all@graphs), value = TRUE)[1]
+A <- seu_all@graphs[[graph_name]]  # dgCMatrix adjacency matrix
+diag(A) <- 0    # remove self-loop 
+A_col <- t(A) 
+n_cells <- ncol(A_col)
+stopifnot(identical(colnames(A_col), cell_names))     # Sanity check: column order should match cell_names
+neighbors_list <- vector("list", n_cells)
+probs_list     <- vector("list", n_cells)
+
+# dgCMatrix is column-compressed:
+#  - @p: pointers to start of each column (length ncol + 1)
+#  - @i: row indices (0-based)
+#  - @x: non-zero values
+for (j in seq_len(n_cells)) {
+  col_start <- A_col@p[j] + 1
+  col_end   <- A_col@p[j + 1]
+  
+  if (col_end >= col_start) {
+    rows <- A_col@i[col_start:col_end] + 1  # row indices (1-based)
+    w    <- A_col@x[col_start:col_end]      # edge weights
+    neighbors_list[[j]] <- rows
+    probs_list[[j]]     <- w / sum(w)
+  } else {
+    neighbors_list[[j]] <- integer(0)
+    probs_list[[j]]     <- numeric(0)
+  }
+}
+
+# Map cell name -> index
+cell_index <- seq_len(n_cells)
+names(cell_index) <- colnames(A_col)
+
+# Compute random-walk-based metrics for Informational Loss cells
+# Initialize result vectors
+HitRate       <- rep(NA_real_, n_cells)
+TopAnnotation <- rep(NA_character_, n_cells)
+
+names(HitRate)       <- cell_names
+names(TopAnnotation) <- cell_names
+
+loss_cells <- which(!is_labeled)     # Indices of Informational Loss cells
+
+# To record cells that never hit any labeled cell
+no_hit_cells <- character(0L)
+
+for (idx in loss_cells) {
+  start_name <- cell_names[idx]
+  
+  # Run random walks
+  hits <- character(n_walks)
+  for (w in seq_len(n_walks)) {
+    hits[w] <- random_walk_first_hit(
+      start_idx      = idx,
+      neighbors_list = neighbors_list,
+      probs_list     = probs_list,
+      is_labeled     = is_labeled,
+      label_vec      = label_vec,
+      T_max          = T_max
+    )
+  }
+  
+  # Separate hit vs no-hit
+  hit_labels <- hits[!is.na(hits)]
+  s <- length(hit_labels)     # total hits
+  r <- s / n_walks            # hit rate
+  
+  HitRate[idx] <- r
+  
+  if (s == 0L) {
+    # No hits: record NA and keep for alert
+    TopAnnotation[idx] <- NA_character_
+    no_hit_cells <- c(no_hit_cells, start_name)
+  } else {
+    # Empirical distribution over biological labels
+    tab <- table(hit_labels)
+    
+    # Most frequent InfoAnnotation
+    top_label <- names(tab)[which.max(tab)]
+    
+    TopAnnotation[idx] <- top_label
+  }
+}
+
+# For labeled cells, set to NA (RW-based metrics are defined only for loss cells)
+HitRate[is_labeled]       <- NA_real_
+TopAnnotation[is_labeled] <- NA_character_
+
+# Store into meta.data
+seu_all$RW_HitRate       <- HitRate
+seu_all$RW_TopAnnotation <- TopAnnotation
+seu_loss <- subset(seu_all, subset = InfoAnnotation == "Low-information cells")
+df <- FetchData(seu_loss, vars = c("nCount_RNA", "RW_HitRate"))
+meta_loss <- seu_all@meta.data[!is_labeled, , drop = FALSE]
+
+# Subsampling comparison
+th_HitRate  <- quantile(meta_loss$RW_HitRate, probs = 50 / 100, na.rm = TRUE)
+good_loss_cells <- rownames(meta_loss)[meta_loss$RW_HitRate > th_HitRate]
+valid_cells <- colnames(seu_all)[is_labeled]
+cells_to_keep <- c(valid_cells, good_loss_cells)
+seurat_pbmc_filtered_II_rw <- subset(seu_all, cells = cells_to_keep)
+
+N <- ncol(seurat_pbmc_filtered_II_rw)
+top_cells <- rownames(seu_all@meta.data)[order(seu_all$nCount_RNA, decreasing = TRUE)][1:N]
+seurat_pbmc_filtered_II_umi <- subset(seu_all, cells = top_cells)
+
+thr <- 0.05
+n_iter <- 100
+sample_n <- 1500
+
+seu_list <- list(
+  filtered_II       = seurat_pbmc_filtered_II,
+  filtered_II_rw    = seurat_pbmc_filtered_II_rw,
+  filtered_II_umi   = seurat_pbmc_filtered_II_umi,
+  filtered_II_valid = seurat_pbmc_filtered_II_valid
+)
+
+betti_list <- vector("list", length(seu_list) * n_iter)
+idx <- 1L
+
+pb <- progress_bar$new(
+  format = "  [:bar] :percent  eta: :eta  elapsed: :elapsed  :message",
+  total = length(seu_list) * n_iter,
+  clear = FALSE,
+  width = 80
+)
+
+for (sample_name in names(seu_list)) {
+  seu_src <- seu_list[[sample_name]]
+  
+  for (iter in seq_len(n_iter)) {
+    pb$tick(tokens = list(message = paste(sample_name, "iter", iter)))
+    
+    set.seed(42 + iter)
+    sampled_cells <- sample(colnames(seu_src), size = sample_n, replace = FALSE)
+    seu_sub <- subset(seu_src, cells = sampled_cells)
+    
+    num_neighbors <- floor(ncol(seu_sub) / 100)
+    
+    seu_sub <- NormalizeData(
+      seu_sub,
+      normalization.method = "LogNormalize",
+      scale.factor = 10000,
+      verbose = FALSE
+    )
+    seu_sub <- FindVariableFeatures(
+      seu_sub,
+      selection.method = "vst",
+      nfeatures = 2000,
+      verbose = FALSE
+    )
+    seu_sub <- ScaleData(seu_sub, verbose = FALSE)
+    seu_sub <- RunPCA(seu_sub, verbose = FALSE)
+    seu_sub <- FindNeighbors(
+      seu_sub,
+      dims = 1:30,
+      k.param = num_neighbors,
+      verbose = FALSE
+    )
+    seu_sub <- FindClusters(
+      seu_sub,
+      resolution = 1,
+      verbose = FALSE
+    )
+    
+    m_counts <- GetAssayData(seu_sub, assay = "RNA", layer = "counts")
+    m_data   <- GetAssayData(seu_sub, assay = "RNA", layer = "data")
+    
+    sce <- as.SingleCellExperiment(seu_sub, assay = "RNA")
+    SummarizedExperiment::assay(sce, "counts")    <- as(m_counts, "dgCMatrix")
+    SummarizedExperiment::assay(sce, "logcounts") <- as(m_data, "dgCMatrix")
+    
+    if ("pca" %in% Reductions(seu_sub)) {
+      SingleCellExperiment::reducedDim(sce, "X_pca") <- Embeddings(seu_sub, "pca")
+    }
+    
+    tmp_h5ad <- tempfile(fileext = ".h5ad")
+    zellkonverter::writeH5AD(sce, tmp_h5ad)
+    
+    adata <- sc$read_h5ad(tmp_h5ad)
+    unlink(tmp_h5ad)
+    
+    adata$obs["seurat_clusters"] <- adata$obs["seurat_clusters"]$astype("category")
+    
+    Xp <- adata$obsm$get("X_pca")
+    if (py_has_attr(Xp, "values")) {
+      Xp <- Xp$values
+    }
+    Xp <- np$ascontiguousarray(np$asarray(Xp, dtype = "float32"))
+    adata$obsm$`__setitem__`("X_pca", Xp)
+    
+    n_pcs_use <- as.integer(min(30L, ncol(Embeddings(seu_sub, "pca"))))
+    
+    sc$pp$neighbors(
+      adata,
+      use_rep = "X_pca",
+      n_neighbors = as.integer(num_neighbors),
+      n_pcs = n_pcs_use
+    )
+    sc$tl$paga(adata, groups = "seurat_clusters")
+    
+    paga_conn <- adata$uns[["paga"]][["connectivities"]]
+    paga_mat  <- py_to_r(paga_conn$toarray())
+    paga_mat[paga_mat < thr] <- 0
+    
+    g <- igraph::graph_from_adjacency_matrix(
+      paga_mat,
+      mode = "undirected",
+      weighted = TRUE,
+      diag = FALSE
+    )
+    g <- igraph::simplify(g, remove.multiple = TRUE, remove.loops = TRUE)
+    
+    comp  <- igraph::components(g)
+    beta0 <- comp$no
+    V     <- igraph::vcount(g)
+    E     <- igraph::ecount(g)
+    beta1 <- E - V + beta0
+    
+    betti_list[[idx]] <- data.frame(
+      sample = sample_name,
+      iter = iter,
+      n_cells = ncol(seu_sub),
+      num_neighbors = num_neighbors,
+      num_clusters = V,
+      beta0 = beta0,
+      beta1 = beta1,
+      stringsAsFactors = FALSE
+    )
+    
+    idx <- idx + 1L
+  }
+}
+
+betti_boot_df <- do.call(rbind, betti_list)
+rownames(betti_boot_df) <- NULL
+
+plot_df <- betti_boot_df
+plot_df$sample <- factor(
+  plot_df$sample,
+  levels = c("filtered_II", "filtered_II_rw", "filtered_II_valid", "filtered_II_umi")
+)
+
+p_beta1 <- ggplot(plot_df, aes(x = sample, y = beta1, fill = sample)) +
+  geom_boxplot(
+    width = 0.15,
+    outlier.shape = NA,
+    color = "black",
+    median.color = "red",
+    median.linewidth = 1.5
+  ) +
+  stat_boxplot(
+    geom = "errorbar",
+    width = 0.08,
+    color = "black"
+  ) +
+  scale_x_discrete(
+    breaks = c("filtered_II", "filtered_II_rw", "filtered_II_valid", "filtered_II_umi"),
+    labels = expression(
+      M,
+      M[50 * "%"],
+      M * "'",
+      M["UMI"]
+    )
+  ) +
+  scale_fill_manual(
+    values = c(
+      "filtered_II" = "steelblue",
+      "filtered_II_rw" = "gray",
+      "filtered_II_valid" = "darkorange",
+      "filtered_II_umi" = "pink"
+    )
+  ) +
+  coord_cartesian(ylim = c(0, 12)) +
+  labs(
+    x = NULL,
+    y = "First Betti number"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 0, hjust = 0.5)
+  )
+
+p_beta1
+ggsave("box_beta1_default_umiVSrw.png", p_beta1, width = 6, height = 4, dpi = 600)
 
 # Imputation or normalization method comparison
 ## scTransformation
@@ -2546,8 +4935,8 @@ ElbowPlot(seurat_pbmc_filtered_II_sct, reduction = "pca", ndims = 50)
 dev.off()
 
 seurat_pbmc_filtered_II_valid_sct <- SCTransform(seurat_pbmc_filtered_II_valid,
-                                           variable.features.n = 2000,
-                                           do.scale = TRUE)
+                                                 variable.features.n = 2000,
+                                                 do.scale = TRUE)
 seurat_pbmc_filtered_II_valid_sct <- RunPCA(seurat_pbmc_filtered_II_valid_sct)
 
 png(filename = "pca_II_valid_sct.png", width = 480, height = 320)
@@ -2616,7 +5005,7 @@ p3d_II_sct <- plot_ly(
 p3d_II_sct     # choose "Zoom"
 saveWidget(
   p3d_II_sct,
-  file = "/path/to/your/dir/pbmc_Mono_scT_clusters_3d_plot.html",
+  file = "pbmc_Mono_scT_clusters_3d_plot.html",
   selfcontained = TRUE
 )
 
@@ -2724,7 +5113,7 @@ p3d_II_alra <- plot_ly(
 p3d_II_alra     # choose "Zoom"
 saveWidget(
   p3d_II_alra,
-  file = "/path/to/your/dir/pbmc_Mono_ALRA_clusters_3d_plot.html",
+  file = "pbmc_Mono_ALRA_clusters_3d_plot.html",
   selfcontained = TRUE
 )
 
@@ -2863,7 +5252,7 @@ p3d_II_saver <- plot_ly(
 p3d_II_saver     # choose "Zoom"
 saveWidget(
   p3d_II_saver,
-  file = "/path/to/your/dir/pbmc_Mono_SAVER_clusters_3d_plot.html",
+  file = "pbmc_Mono_SAVER_clusters_3d_plot.html",
   selfcontained = TRUE
 )
 
@@ -3004,7 +5393,7 @@ p3d_II_scimpute <- plot_ly(
 p3d_II_scimpute     # choose "Zoom"
 saveWidget(
   p3d_II_scimpute,
-  file = "/path/to/your/dir/pbmc_Mono_scImpute_clusters_3d_plot.html",
+  file = "pbmc_Mono_scImpute_clusters_3d_plot.html",
   selfcontained = TRUE
 )
 
@@ -3051,175 +5440,52 @@ DimPlot(seurat_pbmc_filtered_II_valid_scimpute,
   NoAxes() 
 dev.off()
 
------------- # Session Info ------------
+# Session information
 sessionInfo()
+
 R version 4.5.0 (2025-04-11)
-Platform: aarch64-apple-darwin20
-Running under: macOS Sequoia 15.5
-
-Matrix products: default
-BLAS:   /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libBLAS.dylib 
-LAPACK: /Library/Frameworks/R.framework/Versions/4.5-arm64/Resources/lib/libRlapack.dylib;  LAPACK version 3.12.1
-
-locale:
-[1] en_US.UTF-8/en_US.UTF-8/en_US.UTF-8/C/en_US.UTF-8/en_US.UTF-8
-
-time zone: Asia/Tokyo
-tzcode source: internal
-
 attached base packages:
-[1] parallel  stats     graphics  grDevices datasets 
-[6] utils     methods   base     
+  [1] parallel  stats     graphics  grDevices datasets  utils     methods   base     
 
 other attached packages:
- [1] future_1.68.0         htmlwidgets_1.6.4    
- [3] scales_1.4.0          zellkonverter_1.19.2 
- [5] reticulate_1.44.1     SeuratWrappers_0.4.0 
- [7] SeuratDisk_0.0.0.9021 plotly_4.11.0        
- [9] lubridate_1.9.4       forcats_1.0.1        
-[11] stringr_1.6.0         dplyr_1.1.4          
-[13] purrr_1.2.0           readr_2.1.6          
-[15] tidyr_1.3.1           tibble_3.3.0         
-[17] ggplot2_4.0.1         tidyverse_2.0.0      
-[19] Seurat_5.3.1          SeuratObject_5.2.0   
-[21] sp_2.2-0              hdf5r_1.3.12         
-[23] scImpute_0.0.9        doParallel_1.0.17    
-[25] iterators_1.0.14      foreach_1.5.2        
-[27] penalized_0.9-53      survival_3.8-3       
+[1] scImpute_0.0.9        doParallel_1.0.17     iterators_1.0.14      foreach_1.5.2         penalized_0.9-53     
+[6] survival_3.8-6        SAVER_1.1.2           future_1.70.0         progress_1.2.3        htmlwidgets_1.6.4    
+[11] scales_1.4.0          zellkonverter_1.20.1  reticulate_1.45.0     SeuratWrappers_0.4.0  SeuratDisk_0.0.0.9021
+[16] plotly_4.12.0         lubridate_1.9.5       forcats_1.0.1         stringr_1.6.0         dplyr_1.2.1          
+[21] purrr_1.2.1           readr_2.2.0           tidyr_1.3.2           tibble_3.3.1          ggplot2_4.0.2        
+[26] tidyverse_2.0.0       Seurat_5.4.0          SeuratObject_5.3.0    sp_2.2-1              hdf5r_1.3.12         
 
 loaded via a namespace (and not attached):
-  [1] RcppAnnoy_0.0.22           
-  [2] splines_4.5.0              
-  [3] later_1.4.4                
-  [4] filelock_1.0.3             
-  [5] R.oo_1.27.1                
-  [6] polyclip_1.10-7            
-  [7] fastDummies_1.7.5          
-  [8] lifecycle_1.0.4            
-  [9] rprojroot_2.1.1            
- [10] globals_0.18.0             
- [11] lattice_0.22-7             
- [12] MASS_7.3-65                
- [13] crosstalk_1.2.2            
- [14] magrittr_2.0.4             
- [15] rmarkdown_2.30             
- [16] yaml_2.3.11                
- [17] remotes_2.5.0              
- [18] httpuv_1.6.16              
- [19] otel_0.2.0                 
- [20] sctransform_0.4.2          
- [21] spam_2.11-1                
- [22] spatstat.sparse_3.1-0      
- [23] cowplot_1.2.0              
- [24] pbapply_1.7-4              
- [25] RColorBrewer_1.1-3         
- [26] abind_1.4-8                
- [27] Rtsne_0.17                 
- [28] GenomicRanges_1.62.0       
- [29] R.utils_2.13.0             
- [30] BiocGenerics_0.56.0        
- [31] IRanges_2.44.0             
- [32] S4Vectors_0.48.0           
- [33] ggrepel_0.9.6              
- [34] irlba_2.3.5.1              
- [35] listenv_0.10.0             
- [36] spatstat.utils_3.2-0       
- [37] goftest_1.2-3              
- [38] RSpectra_0.16-2            
- [39] spatstat.random_3.4-3      
- [40] fitdistrplus_1.2-4         
- [41] parallelly_1.45.1          
- [42] codetools_0.2-20           
- [43] DelayedArray_0.36.0        
- [44] tidyselect_1.2.1           
- [45] farver_2.1.2               
- [46] matrixStats_1.5.0          
- [47] stats4_4.5.0               
- [48] spatstat.explore_3.6-0     
- [49] Seqinfo_1.0.0              
- [50] jsonlite_2.0.0             
- [51] progressr_0.18.0           
- [52] ggridges_0.5.7             
- [53] tools_4.5.0                
- [54] ica_1.0-3                  
- [55] Rcpp_1.1.0                 
- [56] glue_1.8.0                 
- [57] gridExtra_2.3              
- [58] SparseArray_1.10.2         
- [59] xfun_0.54                  
- [60] here_1.0.2                 
- [61] MatrixGenerics_1.22.0      
- [62] withr_3.0.2                
- [63] BiocManager_1.30.27        
- [64] fastmap_1.2.0              
- [65] basilisk_1.22.0            
- [66] digest_0.6.39              
- [67] rsvd_1.0.5                 
- [68] timechange_0.3.0           
- [69] R6_2.6.1                   
- [70] mime_0.13                  
- [71] scattermore_1.2            
- [72] tensor_1.5.1               
- [73] spatstat.data_3.1-9        
- [74] R.methodsS3_1.8.2          
- [75] generics_0.1.4             
- [76] renv_1.1.5                 
- [77] data.table_1.17.8          
- [78] httr_1.4.7                 
- [79] S4Arrays_1.10.0            
- [80] uwot_0.2.4                 
- [81] pkgconfig_2.0.3            
- [82] gtable_0.3.6               
- [83] lmtest_0.9-40              
- [84] S7_0.2.1                   
- [85] SingleCellExperiment_1.32.0
- [86] XVector_0.50.0             
- [87] htmltools_0.5.9            
- [88] dotCall64_1.2              
- [89] Biobase_2.70.0             
- [90] png_0.1-8                  
- [91] spatstat.univar_3.1-5      
- [92] knitr_1.50                 
- [93] rstudioapi_0.17.1          
- [94] tzdb_0.5.0                 
- [95] reshape2_1.4.5             
- [96] nlme_3.1-168               
- [97] zoo_1.8-14                 
- [98] KernSmooth_2.23-26         
- [99] miniUI_0.1.2               
-[100] pillar_1.11.1              
-[101] grid_4.5.0                 
-[102] vctrs_0.6.5                
-[103] RANN_2.6.2                 
-[104] promises_1.5.0             
-[105] xtable_1.8-4               
-[106] cluster_2.1.8.1            
-[107] evaluate_1.0.5             
-[108] cli_3.6.5                  
-[109] compiler_4.5.0             
-[110] rlang_1.1.6                
-[111] crayon_1.5.3               
-[112] future.apply_1.20.0        
-[113] labeling_0.4.3             
-[114] plyr_1.8.9                 
-[115] stringi_1.8.7              
-[116] viridisLite_0.4.2          
-[117] deldir_2.0-4               
-[118] lazyeval_0.2.2             
-[119] spatstat.geom_3.6-1        
-[120] Matrix_1.7-3               
-[121] dir.expiry_1.18.0          
-[122] RcppHNSW_0.6.0             
-[123] hms_1.1.4                  
-[124] patchwork_1.3.2            
-[125] bit64_4.6.0-1              
-[126] shiny_1.12.0               
-[127] SummarizedExperiment_1.40.0
-[128] kernlab_0.9-33             
-[129] ROCR_1.0-11                
-[130] igraph_2.2.1               
-[131] bit_4.6.0
-
-# SAVER
-packageVersion("SAVER") 
-[1] ‘1.1.2’
+[1] RcppAnnoy_0.0.23            splines_4.5.0               later_1.4.8                 filelock_1.0.3             
+[5] R.oo_1.27.1                 polyclip_1.10-7             fastDummies_1.7.5           lifecycle_1.0.5            
+[9] globals_0.19.1              lattice_0.22-9              MASS_7.3-65                 crosstalk_1.2.2            
+[13] magrittr_2.0.5              rmarkdown_2.31              yaml_2.3.12                 remotes_2.5.0              
+[17] httpuv_1.6.17               otel_0.2.0                  sctransform_0.4.3           spam_2.11-3                
+[21] spatstat.sparse_3.1-0       cowplot_1.2.0               pbapply_1.7-4               RColorBrewer_1.1-3         
+[25] abind_1.4-8                 Rtsne_0.17                  GenomicRanges_1.62.1        R.utils_2.13.0             
+[29] BiocGenerics_0.56.0         IRanges_2.44.0              S4Vectors_0.48.0            ggrepel_0.9.8              
+[33] irlba_2.3.7                 listenv_0.10.1              spatstat.utils_3.2-2        goftest_1.2-3              
+[37] RSpectra_0.16-2             spatstat.random_3.4-5       fitdistrplus_1.2-6          parallelly_1.46.1          
+[41] codetools_0.2-20            DelayedArray_0.36.0         tidyselect_1.2.1            farver_2.1.2               
+[45] matrixStats_1.5.0           stats4_4.5.0                spatstat.explore_3.8-0      Seqinfo_1.0.0              
+[49] jsonlite_2.0.0              progressr_0.19.0            ggridges_0.5.7              tools_4.5.0                
+[53] ica_1.0-3                   Rcpp_1.1.1                  glue_1.8.0                  gridExtra_2.3              
+[57] SparseArray_1.10.9          xfun_0.57                   MatrixGenerics_1.22.0       withr_3.0.2                
+[61] BiocManager_1.30.27         fastmap_1.2.0               basilisk_1.22.0             digest_0.6.39              
+[65] rsvd_1.0.5                  timechange_0.4.0            R6_2.6.1                    mime_0.13                  
+[69] scattermore_1.2             tensor_1.5.1                spatstat.data_3.1-9         R.methodsS3_1.8.2          
+[73] generics_0.1.4              renv_1.2.0                  data.table_1.18.2.1         FNN_1.1.4.1                
+[77] prettyunits_1.2.0           httr_1.4.8                  S4Arrays_1.10.1             uwot_0.2.4                 
+[81] pkgconfig_2.0.3             gtable_0.3.6                lmtest_0.9-40               S7_0.2.1                   
+[85] SingleCellExperiment_1.32.0 XVector_0.50.0              htmltools_0.5.9             dotCall64_1.2              
+[89] Biobase_2.70.0              png_0.1-9                   spatstat.univar_3.1-7       knitr_1.51                 
+[93] rstudioapi_0.18.0           tzdb_0.5.0                  reshape2_1.4.5              nlme_3.1-169               
+[97] zoo_1.8-15                  KernSmooth_2.23-26          miniUI_0.1.2                pillar_1.11.1              
+[101] grid_4.5.0                  vctrs_0.7.2                 RANN_2.6.2                  promises_1.5.0             
+[105] xtable_1.8-8                cluster_2.1.8.2             evaluate_1.0.5              cli_3.6.5                  
+[109] compiler_4.5.0              rlang_1.1.7                 crayon_1.5.3                future.apply_1.20.2        
+[113] labeling_0.4.3              plyr_1.8.9                  stringi_1.8.7               viridisLite_0.4.3          
+[117] deldir_2.0-4                lazyeval_0.2.3              spatstat.geom_3.7-3         Matrix_1.7-5               
+[121] dir.expiry_1.18.0           RcppHNSW_0.6.0              hms_1.1.4                   patchwork_1.3.2            
+[125] bit64_4.6.0-1               shiny_1.13.0                SummarizedExperiment_1.40.0 kernlab_0.9-33             
+[129] ROCR_1.0-12                 igraph_2.2.2                bit_4.6.0
