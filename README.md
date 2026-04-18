@@ -1,4 +1,4 @@
-# README (Preprint Version)
+# README
 Title : 
 
 Graph topology reframes the coherence of cell state manifold inference under heterogeneous single-cell observation
@@ -6,7 +6,7 @@ Graph topology reframes the coherence of cell state manifold inference under het
 
 Authors : 
 
-Tomohiro Tamura(@,†,1,2), Yusuke Yamane(@,1), Yuji Okano(1,3), Tetsuo Ishikawa(1,3,4), Kazuhiro Sakurada(1,5)
+Tomohiro Tamura(@,†,1,2,3), Yusuke Yamane(@,1), Yuji Okano(1,4), Tetsuo Ishikawa(1,4,5), Kazuhiro Sakurada(1,6)
 
 
 Affiliations : 
@@ -19,25 +19,25 @@ Affiliations :
 
 2 Department of Diabetes, Endocrinology, and Metabolism, National Center for Global Health and Medicine, Japan Institute for Health Security, Shinjuku, Japan.
 
-3 Division of Applied Mathematical Science, RIKEN Center for Interdisciplinary Theoretical and Mathematical Sciences (iTHEMS), RIKEN, Yokohama, Japan.
+3 Laboratory of Cancer Cell Systems, National Cancer Center Research Institute, Chuo, Japan. 
 
-4 Collective Intelligence Research Laboratory, Graduate School of Arts and Sciences, The University of Tokyo, Meguro, Japan.
+4 Division of Applied Mathematical Science, RIKEN Center for Interdisciplinary Theoretical and Mathematical Sciences (iTHEMS), RIKEN, Yokohama, Japan.
 
-5 Predictive Medicine Special Project, RIKEN Center for Integrative Medical Sciences (IMS), Yokohama, Japan.
+5 Collective Intelligence Research Laboratory, Graduate School of Arts and Sciences, The University of Tokyo, Meguro, Japan.
+
+6 Predictive Medicine Special Project, RIKEN Center for Integrative Medical Sciences (IMS), Yokohama, Japan.
 
 
 Journal : 
 
-bioRxiv -the Preprint server-
+Computational and Structural Biotechnology Journal
+
+DOI :
+
+https://doi.org/10.34133/csbj.0087
 
 
 Supplementary information deposited in this repository : 
-
-- Supplementary figure legends at Preprint (pdf)
-
-- Supplementary figures at Preprint (not interactive, pdf)
-
-- Supplementary figures at Preprint (interactive, html)
 
 - Source code of Python at Preprint for reproducing the results (first)
 
