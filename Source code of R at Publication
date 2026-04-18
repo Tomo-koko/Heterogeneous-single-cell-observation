@@ -4872,6 +4872,7 @@ for (sample_name in names(seu_list)) {
 
 betti_boot_df <- do.call(rbind, betti_list)
 rownames(betti_boot_df) <- NULL
+write.csv(betti_boot_df, file = "betti_df_rwVSumi.csv", row.names = FALSE)
 
 plot_df <- betti_boot_df
 plot_df$sample <- factor(
